@@ -51,7 +51,13 @@ offset size field          notes
 | 0–3 | version | protocol version, currently `1` |
 | 4 | tilt_valid | 1 if tilt fields are meaningful this report |
 | 5 | dist_valid | 1 if distance is meaningful (pen in range) |
-| 6–7 | reserved | 0 |
+| 6–7 | orientation | screen orientation: `0`=portrait native, `1`/`2`/`3` = 90/180/270° CW |
+
+> The orientation bits are always valid and carry the device's current screen orientation
+> (from the daemon's accelerometer + xochitl-lock detector, `daemon/src/orientation.rs`).
+> Added within version `1` using previously-reserved bits, so older receivers that mask them
+> off are unaffected. The Windows side reads them via `PenPacket.Orientation` to rotate the
+> OTD area to match the device.
 
 ## Mapping to OTD (Windows side)
 

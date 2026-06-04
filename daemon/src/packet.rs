@@ -55,8 +55,9 @@ impl PenState {
         self.tool_pen || self.eraser
     }
 
-    /// Serialize the current state into an 18-byte little-endian PenPacket.
-    pub fn serialize(&self, ts_us: u32, buf: &mut [u8; SIZE]) {
+    /// Serialize the current state into an 18-byte little-endian PenPacket. `orientation`
+    /// (0..3 = portrait/90/180/270) rides in flags bits 6-7 (see protocol/packet.md).
+    pub fn serialize(&self, ts_us: u32, orientation: u8, buf: &mut [u8; SIZE]) {
         buf[0..4].copy_from_slice(&ts_us.to_le_bytes());
         buf[4..6].copy_from_slice(&self.x.to_le_bytes());
         buf[6..8].copy_from_slice(&self.y.to_le_bytes());
@@ -83,8 +84,8 @@ impl PenState {
         }
         buf[16] = buttons;
 
-        // flags: low nibble = version 1; bit4 tilt_valid; bit5 dist_valid
-        buf[17] = 0x01 | 0x10 | 0x20;
+        // flags: low nibble = version 1; bit4 tilt_valid; bit5 dist_valid; bits6-7 orientation
+        buf[17] = 0x01 | 0x10 | 0x20 | ((orientation & 0x03) << 6);
     }
 }
 

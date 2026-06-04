@@ -21,11 +21,13 @@
 //! See docs/phase0-findings.md for device facts and protocol/packet.md for the wire format.
 
 mod control;
+mod orientation;
 mod packet;
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,6 +64,10 @@ fn main() -> std::io::Result<()> {
     // plugin heartbeat goes stale. Own threads; never touches the pen stream below.
     control::spawn();
 
+    // Detect screen orientation (accelerometer + xochitl lock) and publish it; the pen
+    // stream below stamps it into every packet so OTD can rotate the area to match.
+    let orient = orientation::spawn();
+
     let refc = Arc::new(Mutex::new(WakeRefcount::default()));
 
     for incoming in listener.incoming() {
@@ -69,6 +75,7 @@ fn main() -> std::io::Result<()> {
             Ok(stream) => {
                 let peer = stream.peer_addr().ok();
                 let refc = Arc::clone(&refc);
+                let orient = Arc::clone(&orient);
                 thread::spawn(move || {
                     // First client in: hold the device awake so autosleep doesn't power
                     // down the digitizer. xochitl is left running (no grab; pausing it
@@ -82,7 +89,7 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                     log(&format!("client connected: {peer:?}"));
-                    if let Err(e) = handle_client(stream) {
+                    if let Err(e) = handle_client(stream, &orient) {
                         log(&format!("session ended: {e}"));
                     }
                     // Last client out: release the wakelock and let the device sleep.
@@ -104,15 +111,15 @@ fn main() -> std::io::Result<()> {
 }
 
 /// One client session: send hello, then stream until the socket breaks.
-fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
+fn handle_client(mut stream: TcpStream, orient: &AtomicU8) -> std::io::Result<()> {
     stream.set_nodelay(true)?; // latency over throughput
     stream.write_all(b"IBR1")?; // protocol hello (version 1)
-    stream_pen(&mut stream)
+    stream_pen(&mut stream, orient)
 }
 
 /// Open the pen device and stream PenPackets until the socket write fails (client gone)
 /// or the device read errors.
-fn stream_pen(stream: &mut TcpStream) -> std::io::Result<()> {
+fn stream_pen(stream: &mut TcpStream, orient: &AtomicU8) -> std::io::Result<()> {
     let mut dev = match find_pen() {
         Some(d) => d,
         None => {
@@ -170,7 +177,7 @@ fn stream_pen(stream: &mut TcpStream) -> std::io::Result<()> {
                             EventType::SYNCHRONIZATION => {
                                 if code == 0 {
                                     let ts = start.elapsed().as_micros() as u32;
-                                    state.serialize(ts, &mut buf);
+                                    state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
                                     stream.write_all(&buf)?; // Err = client disconnected
                                     last_send = Instant::now();
                                 }
@@ -191,7 +198,7 @@ fn stream_pen(stream: &mut TcpStream) -> std::io::Result<()> {
         // still forwarded, so OTD sees the pen leave proximity.
         if state.in_range() && last_send.elapsed() >= KEEPALIVE {
             let ts = start.elapsed().as_micros() as u32;
-            state.serialize(ts, &mut buf);
+            state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
             stream.write_all(&buf)?;
             last_send = Instant::now();
         }

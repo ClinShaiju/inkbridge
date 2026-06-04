@@ -28,6 +28,9 @@ namespace Inkbridge
         public readonly byte   Buttons;
         public readonly byte   Flags;
 
+        /// <summary>Screen orientation from flags bits 6-7: 0=portrait native, 1/2/3 = 90/180/270° CW.</summary>
+        public byte Orientation => (byte)((Flags >> 6) & 0x03);
+
         public PenPacket(uint ts, ushort x, ushort y, ushort pressure, ushort distance,
                          short tiltX, short tiltY, byte buttons, byte flags)
         {
