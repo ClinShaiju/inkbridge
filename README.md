@@ -34,9 +34,6 @@ This is a **working prototype** and an unofficial hobby project — it is **not 
 reMarkable**. The core path (pen → pressure-sensitive strokes in Krita) is built and verified. It
 requires root SSH access to your device; use at your own risk.
 
-See [`PROJECT.md`](PROJECT.md#01-implementation-status-as-built) for a precise breakdown of what
-exists today versus the original design plan.
-
 ## How it works
 
 ```
@@ -65,15 +62,13 @@ reMarkable Paper Pro (USB)                         Windows PC
   you can see where the pen is "live", plus connection/latency/rate stats. It is read-only — OTD on
   the PC owns all configuration.
 
-The wire format is specified in [`protocol/packet.md`](protocol/packet.md).
 
 ## Requirements
 
 - A **reMarkable Paper Pro** with developer/root SSH access, connected over USB (RNDIS; host reaches
   the tablet at `10.11.99.1`). Python 3 (Entware) on-device for the optional visualizer.
 - A **Windows PC** with [OpenTabletDriver **0.6.7**](https://opentabletdriver.net/), the VoiDPlugins
-  *Windows Ink* plugin, and the X9VoiD *VMulti* driver (the last two are what make pressure work on
-  Windows — OTD doesn't bundle them).
+  *Windows Ink* plugin, and the X9VoiD *VMulti* driver.
 
 ## Getting started
 
@@ -216,13 +211,6 @@ INKBRIDGE_PW=your-device-password
 The OTD plugin and daemon also honor `INKBRIDGE_HOST` / `INKBRIDGE_PORT`; `INKBRIDGE_SYNTHETIC=1`
 enables the host-only pressure test source.
 
-## Caveats
-
-- Pressure on Windows requires the **Windows Ink** plugin **and** the correct **VMulti** fork — see
-  [`docs/feasibility.md` §2](docs/feasibility.md).
-- The OTD plugin reflects over OTD internals and is pinned to **0.6.7**; other versions may need
-  retargeting.
-
 ## Contributing
 
 Issues and pull requests are welcome. This is an early prototype, so expect rough edges; if you're
@@ -232,8 +220,6 @@ adapting it to a different device or OTD version, the verified device facts in
 
 ## Licence
 
-No licence has been chosen yet. Until one is added, all rights are reserved by the author.
+Released under the [MIT License](LICENSE). © 2026 Clin Shaiju.
 
 ---
-
-<p align="center"><sub>Not affiliated with or endorsed by reMarkable AS or the OpenTabletDriver project.</sub></p>
