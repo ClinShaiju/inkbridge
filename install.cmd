@@ -13,8 +13,9 @@ REM
 REM  Works from a checked-out repo OR the flattened release zip - each file is
 REM  resolved from a list of candidate locations.
 REM
-REM  Just double-click it, or run:  install.cmd          (plugin only)
-REM                                 install.cmd /daemon  (also install daemon)
+REM  Just double-click it: it installs the OTD plugin and then ASKS whether to
+REM  also install the daemon on the tablet over SSH.
+REM  Run  install.cmd /daemon  to install the daemon without being asked.
 REM ===========================================================================
 set "ROOT=%~dp0"
 set "DEVHOST=10.11.99.1"
@@ -113,8 +114,8 @@ if defined DODAEMON (
     )
   )
 ) else (
-  echo ==^> Daemon ^(tablet side^) - skipped
-  echo     Re-run with  install.cmd /daemon  to push it, or use daemon\deploy.py ^(reads .env^).
+  echo ==^> Daemon ^(tablet side^) - skipped ^(you answered No^)
+  echo     Re-run and answer Yes, or  install.cmd /daemon , or daemon\deploy.py ^(reads .env^).
 )
 
 REM --- Next steps that need you (driver + GUI) ---

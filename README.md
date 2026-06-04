@@ -87,15 +87,16 @@ then run the installer — or do it by hand. To build the binaries yourself inst
    `daemon/deploy.py`, or a manual `scp`). It is **not** used at runtime — the plugin talks to the
    daemon over a plain TCP socket on the USB link, with no login. Skip this if you'll install the
    daemon some other way or it's already installed.
-2. **Run `install.cmd`** — just double-click it (or run `install.cmd /daemon` from a terminal to
-   also install the on-tablet daemon over SSH). **Have OpenTabletDriver open** when you run it — the
-   installer detects OTD's folder from the running process (it's extract-and-run, so the path
+2. **Run `install.cmd`** — just double-click it. **Have OpenTabletDriver open** when you run it —
+   the installer detects OTD's folder from the running process (it's extract-and-run, so the path
    varies). It:
    - copies the OTD plugin + tablet config into `%LOCALAPPDATA%\OpenTabletDriver`,
-   - auto-detects your OpenTabletDriver folder and remembers it (OTD is extract-and-run, so the
-     path varies — saved as the `OTD_DIR` env var for the optional `start-inkbridge.cmd` helper),
-   - optionally installs the daemon on the reMarkable,
-   - then prints the two manual pieces below.
+   - remembers your OpenTabletDriver folder (saved as the `OTD_DIR` env var for the optional
+     `start-inkbridge.cmd` helper),
+   - then **asks whether to also install the daemon on the tablet over SSH** — answer **y** to do
+     it (this is where the `.env` password is used). Prefer no prompt? Run `install.cmd /daemon` to
+     install the daemon non-interactively.
+   - finally, prints the two manual pieces below.
 3. **Install the pressure pieces** (OTD has no built-in pressure on Windows):
    - **VMulti driver** — the X9VoiD fork: <https://github.com/X9VoiD/vmulti-bin/releases/latest>
      (if an XP-Pen "Pentablet HID" VMulti is already present, let the X9VoiD installer replace it).
