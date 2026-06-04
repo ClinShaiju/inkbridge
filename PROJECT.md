@@ -1,5 +1,11 @@
 # inkbridge — reMarkable Paper Pro as a Pressure-Sensitive Drawing Tablet for Windows
 
+> **This document is the original design plan and audit brief.** It records the goals,
+> assumptions, and phased plan from before implementation. Several assumptions changed once the
+> hardware was verified and the components were built — see **[Implementation Status](#01-implementation-status-as-built)**
+> directly below, and **[README.md](README.md)** for the current, accurate overview. Where this
+> plan and the Implementation Status / `docs/` disagree, the latter win.
+
 ## 0. Summary
 
 Turn a reMarkable Paper Pro (rMPP) into a full-featured graphics tablet input device for
@@ -15,6 +21,42 @@ management UI essentially for free — without writing or signing a kernel-mode 
 
 Primary target use case: raw, low-latency cursor input and digital art
 (Krita / Clip Studio / Photoshop, requiring real pressure sensitivity).
+
+---
+
+## 0.1. Implementation Status (as built)
+
+What actually exists today, and where reality diverged from the plan below. (Details in `docs/`
+and `README.md`.)
+
+**Built and working:**
+- `daemon/` — Rust daemon on the rMPP: reads `Elan marker input` (event2) via evdev, streams
+  18-byte `PenPacket`s over TCP `:9292`, plus a control plane on `:9293`. Cross-compiled static
+  musl (aarch64), installed as a systemd service.
+- `otd-plugin/` — OpenTabletDriver 0.6.7 plugin (C#/.NET 8): registers a synthetic network-sourced
+  tablet, decodes packets, feeds position/pressure/tilt/hover/buttons into OTD. Also hosts the
+  PC-side telemetry that publishes link status + active area to the device.
+- `appload/` — on-device AppLoad app (QML + Python backend): a **read-only** visualizer of the
+  active-area box + connection/latency/rate stats.
+- `protocol/`, `docs/`, `tools/` — wire spec, findings, and diagnostic scripts.
+
+**Key corrections to the plan below (these supersede §3/§4/§5 where they conflict):**
+1. **The daemon never suspends or pauses xochitl.** xochitl does not grab the pen, so the daemon
+   reads `event2` *alongside* it. Pausing xochitl would trip its systemd watchdog and reboot the
+   device. The real requirement is holding a `/sys/power/wake_lock` while a client is connected
+   (autosleep otherwise powers down the digitizer). See `docs/phase0-findings.md`.
+2. **The AppLoad app is a read-only mirror, not a controller.** It runs *inside* xochitl (XOVI/
+   AppLoad injection — it cannot and does not suspend xochitl), is written in QML + a small Python
+   backend (not C/Qt Quick with EPD code), and does **not** do in-app calibration or orientation
+   control. OpenTabletDriver on the host owns all configuration; the app only displays the live
+   mapping. See `docs/appload-research.md` and `docs/appload-ui-spec.md`.
+3. **Configuration flows host → device, pushed by the OTD plugin** (`InkbridgeTelemetry.cs`), not by
+   a standalone companion app — there is no separate `companion-ui/` and no standalone area-push
+   script; that role lives in the always-running plugin.
+4. **Pressure on Windows requires two external pieces** OTD does not bundle: the VoiDPlugins
+   *Windows Ink* output plugin and the X9VoiD *VMulti* driver. See `docs/feasibility.md` §2.
+5. **Verified device facts** replaced assumptions: pen reports at ~480–500 Hz, pressure is
+   0..4096, and tilt + eraser + true hover distance are all exposed. See `docs/phase0-findings.md`.
 
 ---
 
@@ -69,13 +111,13 @@ Primary target use case: raw, low-latency cursor input and digital art
 │  └───────────────────┬──────────────────────┘ │
 │                       │ (evdev fd, read-only)   │
 │  ┌────────────────────▼──────────────────────┐ │
-│  │ inkbridge-appload (AppLoad app, C/Qt Quick) │ │
-│  │  • suspends xochitl (owns display cleanly)  │ │
+│  │ inkbridge-appload (AppLoad app, QML+Python) │ │
+│  │  • read-only [as built]; runs INSIDE xochitl│ │
 │  │  • EPD overlay: active-area rectangle,      │ │
 │  │    connection status, latency readout        │ │
-│  │  • on-device area calibration (tap corners) │ │
-│  │  • orientation toggle (portrait/landscape)  │ │
-│  │  • sends config changes → daemon via IPC    │ │
+│  │  • (never suspends it); OTD owns all config  │ │
+│  │  • subscribes to daemon control plane :9293  │ │
+│  │  • shows the live mapping (sends no config)  │ │
 │  │  • redraws EPD only on config change        │ │
 │  └───────────────────────────────────────────┘ │
 └──────────────────────┬───────────────────────┘

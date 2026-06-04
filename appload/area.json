@@ -1,5 +1,5 @@
 {
-  "_comment": "Seed/fallback area shown when no live update has arrived from the daemon control port. Mirrors the OpenTabletDriver 'Tablet' area on the host (Output tab). The host pusher (tools/area_push.py) overwrites this live from OTD's settings.json. All mm are in the tablet/digitizer physical frame; rotation is the OTD area Rotation in degrees.",
+  "_comment": "Seed/fallback area shown when no live update has arrived from the daemon control port. Mirrors the OpenTabletDriver 'Tablet' area on the host (Output tab). The OTD plugin's telemetry (otd-plugin/InkbridgeTelemetry.cs) publishes the live area to the daemon from OTD's settings.json, overriding this seed. All mm are in the tablet/digitizer physical frame; rotation is the OTD area Rotation in degrees.",
   "surface": {
     "max_x": 11180,
     "max_y": 15340,

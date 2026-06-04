@@ -5,41 +5,31 @@ discovery (`docs/phase0-findings.md`). All multi-byte fields **little-endian**.
 
 ## Transport
 
-- Raw TCP over USB RNDIS. Daemon listens on `10.11.99.1:<PORT>` (PORT TBD, default 9292).
+- Raw TCP over USB RNDIS. The daemon listens on `0.0.0.0:9292` (reach it at `10.11.99.1:9292`
+  over the USB tether).
 - `TCP_NODELAY` set; no Nagle batching (latency over throughput).
 - One `PenPacket` per evdev `SYN_REPORT` (coalesce all axis updates since the last SYN into
-  one packet — do not emit a packet per axis event).
-- No length prefix: packets are fixed size (16 bytes). Receiver reads in 16-byte frames.
+  one packet — do not emit a packet per axis event). While the pen is in range the daemon also
+  resends the current state at ~60 Hz as a keepalive; it goes quiet once the pen leaves range.
+- No length prefix: packets are fixed size (**18 bytes**). The receiver reads in 18-byte frames.
 - A 4-byte ASCII hello `IBR1` is sent once by the daemon on connect, before the first packet,
   so the client can validate the stream and protocol version (`1`).
 
-## `PenPacket` (16 bytes)
+> A separate **control plane** runs on TCP `:9293` (newline-delimited JSON, not this binary
+> format) for the on-device visualizer — area config + link status. It is documented in
+> `daemon/src/control.rs` and `docs/appload-ui-spec.md`, and is independent of this pen stream.
 
-| off | type | field | range | meaning |
-|----:|------|-------|-------|---------|
-| 0 | u32 | `timestamp_us` | — | daemon monotonic clock, microseconds |
-| 4 | u16 | `x` | 0..11180 | raw `ABS_X` (short edge ≈157 mm) |
-| 6 | u16 | `y` | 0..15340 | raw `ABS_Y` (long edge ≈210 mm) |
-| 8 | u16 | `pressure` | 0..4096 | raw `ABS_PRESSURE` (4097 levels) |
-| 10 | u16 | `distance` | 0..65535 | raw `ABS_DISTANCE` (hover proximity) |
-| 12 | i16 | `tilt_x` | -9000..9000 | `ABS_TILT_X`, centidegrees |
-| 14 | i16 | `tilt_y` | -9000..9000 | `ABS_TILT_Y`, centidegrees |
-| — | — | — | — | (buttons/flags fold into the 16 bytes — see note) |
-
-> Layout note: the table above is 16 bytes through `tilt_y`. Buttons + flags require 2 more
-> bytes → the packet is **18 bytes**, not 16. Final committed layout:
-
-## `PenPacket` — committed 18-byte layout
+## `PenPacket` — 18-byte layout
 
 ```
 offset size field          notes
 0      4    timestamp_us   u32 LE, monotonic µs
-4      2    x              u16 LE, 0..11180
-6      2    y              u16 LE, 0..15340
-8      2    pressure       u16 LE, 0..4096
-10     2    distance       u16 LE, 0..65535 (hover)
-12     2    tilt_x         i16 LE, -9000..9000
-14     2    tilt_y         i16 LE, -9000..9000
+4      2    x              u16 LE, 0..11180   (raw ABS_X, short edge ≈157 mm)
+6      2    y              u16 LE, 0..15340   (raw ABS_Y, long edge ≈210 mm)
+8      2    pressure       u16 LE, 0..4096    (raw ABS_PRESSURE, 4097 levels)
+10     2    distance       u16 LE, 0..65535   (raw ABS_DISTANCE, hover proximity)
+12     2    tilt_x         i16 LE, -9000..9000 (ABS_TILT_X, centidegrees)
+14     2    tilt_y         i16 LE, -9000..9000 (ABS_TILT_Y, centidegrees)
 16     1    buttons        bitfield (below)
 17     1    flags          version + valid bits (below)
                            total = 18 bytes

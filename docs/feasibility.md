@@ -192,7 +192,13 @@ The authoritative spec lives in `protocol/packet.md`.
 
 ---
 
-## 6. AppLoad on-device UI (Phase 5) — **UNVERIFIED, deferred**
+## 6. AppLoad on-device UI (Phase 5) — **UNVERIFIED, deferred** *(since BUILT — see note)*
+
+> **Update (post-audit):** AppLoad was subsequently confirmed installed and the on-device app
+> **was built** as a read-only visualizer (`appload/`). The "must suspend xochitl / write EPD
+> code" worries below were based on a wrong mental model and do not apply — AppLoad runs *inside*
+> xochitl. See `docs/appload-research.md` and `docs/appload-ui-spec.md` for the as-built design.
+> The bullets below are the original pre-build assessment, kept for the record.
 
 - The device runs systemd + xochitl; AppLoad is a third-party launcher framework. It was
   **not** found installed in this Phase 0 sweep (no `appload` in PATH; `/opt` shows custom

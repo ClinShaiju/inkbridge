@@ -78,27 +78,39 @@ wlan0: inet 192.168.0.189/24 (also online — WiFi stretch goal is viable)
 `INKBRIDGE_TCP_OK`. So arbitrary TCP ports work over the USB tether — the daemon does not
 need to tunnel through SSH.
 
-## CRITICAL: xochitl holds an exclusive grab on the pen device
+## xochitl and the pen device — CORRECTED (do not pause xochitl)
 
-Measured live: `xochitl` (the reMarkable UI) opens `/dev/input/event2` and **EVIOCGRAB**s it.
-While xochitl runs, **no other process receives pen events** — `evtest` opens the node and
-prints capabilities but gets zero events. Confirmed: `pidof xochitl` → that pid is the only
-holder of event2; pausing it (`kill -STOP`) immediately releases events to evtest.
+> **⚠️ This section's original conclusion was wrong and has been superseded by later
+> verification. The daemon does NOT (and must NOT) pause xochitl.** The corrected model below
+> is what the shipped daemon implements (`daemon/src/main.rs`). Kept for the historical record.
 
-**Implication for the daemon (not just the AppLoad phase):** the inkbridge daemon MUST stop
-or pause xochitl to read the pen. Options:
-- `systemctl stop xochitl` (clean; UI gone until restarted), or
-- `kill -STOP $(pidof xochitl)` / `kill -CONT` (pause/resume; reversible, fast — used for the
-  rate capture), or
-- the daemon takes its own EVIOCGRAB *after* xochitl is stopped.
+**Original measurement:** an early test suggested `xochitl` `EVIOCGRAB`s `/dev/input/event2`
+and starved other readers, implying the daemon would have to `systemctl stop` or `kill -STOP`
+xochitl to read the pen.
 
-This is acceptable: inkbridge is input-only, the e-ink screen is not used as a tablet display,
-so suspending xochitl in "tablet mode" costs nothing. The daemon should restore xochitl on
-exit. This moves "manage xochitl" from the optional AppLoad phase into the **core daemon**.
+**What is actually true (verified):**
+- xochitl does **NOT** hold an `EVIOCGRAB` on the pen — a fresh `EVIOCGRAB` from another process
+  succeeds, and a plain (un-grabbed) reader on `event2` receives **all** pen events *alongside*
+  a running xochitl. Two concurrent un-grabbed readers each get every event.
+- **Never SIGSTOP / `systemctl stop` xochitl.** xochitl runs under systemd with `WatchdogSec=60`;
+  pausing it makes it miss its `sd_notify` heartbeat, which trips the failure path and **reboots
+  the device**. (This is also why the AppLoad on-device app can run concurrently — see
+  `docs/appload-research.md`.)
+- The real constraint is **power, not grabbing**: the rMPP uses Android-style opportunistic
+  suspend (`/sys/power/autosleep = mem`). With no wakelock held the SoC suspends to RAM and the
+  SPI digitizer powers down, producing **zero** events. The daemon therefore holds a
+  `/sys/power/wake_lock` for the duration of each client session and releases it when the last
+  client disconnects.
+- Cost of leaving xochitl up: it still inks the e-ink while we read (cosmetic only — this is an
+  input-only use). That is expected and harmless.
+
+So "manage xochitl" is **not** a daemon responsibility; "hold a wakelock while a client is
+connected" is.
 
 ## Digitizer report rate — MEASURED
 
-Captured ~10 s of active scribbling (xochitl paused) on `event2`:
+Captured ~10 s of active scribbling on `event2` (during early bring-up, before the un-grabbed
+read was verified):
 - **4792 intervals, mean 2.09 ms → ~479 Hz**, sd 1.20 ms, min 0.27 ms, max 16.05 ms.
 - Far above the plan's assumed 150–200 Hz. Excellent for low-latency, smooth input.
 - Jitter: occasional 16 ms gaps (pen moving slowly / lifting); typical interval ~2 ms.

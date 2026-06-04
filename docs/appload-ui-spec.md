@@ -13,18 +13,23 @@ below are **superseded** — those are OTD's job and were intentionally dropped 
 source of truth.
 
 Data path (host → device, isolated from the latency-critical pen stream):
-- `tools/area_push.py` (host) reads OTD `settings.json` area + `tablet-spec.json` surface, measures
-  link latency, and PUBLISHES `{"type":"config"|"status","data":{…}}` to the daemon.
-- `daemon/src/control.rs` — new pub/sub relay on **TCP :9293** (separate from the pen path on
-  :9292; `stream_pen` untouched). Stores latest config/status, replays to subscribers on connect.
-- `appload/backend/entry` (Python) subscribes to :9293, forwards messages to the QML frontend,
-  and serves `appload/area.json` as a seed when the control link is down.
+- **The OTD plugin itself publishes** (`otd-plugin/InkbridgeTelemetry.cs`, started once from
+  `InkbridgeTool`). It reads OTD's `settings.json` active area + the fixed surface geometry,
+  measures control-link latency (ping/pong) and the received pen-packet rate, and PUBLISHES
+  `{"type":"config"|"status","data":{…}}` to the daemon as role `IBCP`. (An earlier design used a
+  standalone `tools/area_push.py`; that was folded into the always-running plugin so there is no
+  separate companion process.)
+- `daemon/src/control.rs` — pub/sub relay on **TCP :9293** (separate from the pen path on
+  :9292; `stream_pen` untouched). Stores latest config/status, replays to subscribers on connect,
+  and broadcasts `disconnected` when the publisher heartbeat goes stale.
+- `appload/backend/entry` (Python) subscribes to :9293 (role `IBCS`), forwards messages to the QML
+  frontend, and serves `appload/area.json` as a seed when the control link is down.
 - `appload/frontend/Main.qml` renders the box (handles 90/270 rotation footprint swap) + stats.
 
-Why the host pusher instead of the OTD plugin: `InkbridgeTool` is an `ITool`/`IDeviceHub` and does
-**not** naturally hold the profile's area mapping (it lives in OTD's `AbsoluteModeSettings`, which
-the GUI edits and OTD writes to `settings.json`). Reading that file is the robust, low-risk source
-of truth and keeps the delicate pen path untouched. A plugin-reflection pusher is a later option.
+Why the plugin pushes the area: `InkbridgeTool` is an `ITool`/`IDeviceHub` and does **not**
+naturally hold the profile's area mapping (it lives in OTD's `AbsoluteModeSettings`, which the GUI
+edits and OTD writes to `settings.json`). Reading that file is the robust, low-risk source of truth
+and keeps the delicate pen path untouched.
 
 Deploy: `appload/deploy.py` (SFTP). The daemon must be rebuilt+redeployed to expose :9293.
 

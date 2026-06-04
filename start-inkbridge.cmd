@@ -23,8 +23,9 @@ echo Applying inkbridge mouse-mode settings (connects to rMPP at 10.11.99.1:9292
 echo.
 echo ===========================================================
 echo  inkbridge is running. Draw on the reMarkable - the Windows
-echo  cursor should track the pen. (The rMPP screen freezes while
-echo  connected; that is normal - xochitl is paused.)
+echo  cursor should track the pen. The rMPP keeps working normally
+echo  (xochitl is never paused); you will just see ink strokes on
+echo  the e-ink as you draw - that is cosmetic and harmless.
 echo.
 echo  To STOP: run  stop-inkbridge.cmd   (or close the daemon).
 echo ===========================================================
