@@ -1,0 +1,23 @@
+{
+  "Name": "inkbridge rMPP",
+  "Specifications": {
+    "Digitizer": {
+      "Width": 179,
+      "Height": 239,
+      "MaxX": 11180,
+      "MaxY": 15340
+    },
+    "Pen": {
+      "MaxPressure": 4096,
+      "ButtonCount": 2
+    }
+  },
+  "DigitizerIdentifiers": [
+    {
+      "VendorID": 4617,
+      "ProductID": 18757,
+      "InputReportLength": 18,
+      "ReportParser": "Inkbridge.InkbridgeReportParser"
+    }
+  ]
+}

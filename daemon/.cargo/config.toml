@@ -1,0 +1,5 @@
+# Cross-compile to the rMPP (aarch64) without a C toolchain or Docker:
+# link the fully-static musl binary with Rust's bundled LLVM linker.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Inkbridge</AssemblyName>
+    <RootNamespace>Inkbridge</RootNamespace>
+    <!-- Plugin-style output; do not pull OTD assemblies into the deploy folder. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Matches the installed OpenTabletDriver 0.6.7. ExcludeAssets=runtime keeps
+         OpenTabletDriver.Plugin.dll out of our output (the daemon already provides it). -->
+    <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.7" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+</Project>

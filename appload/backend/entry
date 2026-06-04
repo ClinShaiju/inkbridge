@@ -1,0 +1,153 @@
+#!/opt/bin/python3
+"""
+inkbridge AppLoad backend — read-only relay.
+
+AppLoad wire protocol (unix socket at argv[1], we connect as client):
+  each message = 8-byte header then payload:
+      u32 msg_type  (little-endian)
+      u32 length    (little-endian, bytes of payload)
+      <length bytes UTF-8 contents>
+  system types: 0xFFFFFFFF = TERMINATE, 0xFFFFFFFE = NEW_COORDINATOR.
+
+App message types (must match frontend/Main.qml):
+  from frontend: 1 = GET_CONFIG, 2 = GET_STATUS
+  to   frontend: 1 = CONFIG,     2 = STATUS   (contents = JSON string)
+
+Data source: the daemon control plane (TCP 127.0.0.1:9293) as a SUBSCRIBER ("IBCS"). The daemon
+broadcasts status (connected/rate) itself, and relays config pushed once by the host companion.
+Newline-delimited JSON there: {"type":"config"|"status","data":{...}} -> forwarded to the frontend.
+On GET_CONFIG we also answer immediately from the on-disk seed so the box has data even before the
+daemon/companion are up. This backend never reads evdev.
+"""
+
+import json
+import os
+import socket
+import struct
+import sys
+import threading
+import time
+
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SEED_FILE = os.path.join(APP_DIR, "area.json")
+CONTROL_HOST, CONTROL_PORT = "127.0.0.1", 9293
+
+# AppLoad system message types
+SYS_TERMINATE = 0xFFFFFFFF
+SYS_NEW_COORDINATOR = 0xFFFFFFFE
+# app types
+MSG_GET_CONFIG, MSG_GET_STATUS = 1, 2
+MSG_CONFIG, MSG_STATUS = 1, 2
+
+HEADER = struct.Struct("<II")
+
+
+def load_seed():
+    try:
+        with open(SEED_FILE, "r") as f:
+            d = json.load(f)
+        d.pop("_comment", None)
+        return d
+    except Exception as e:
+        print(f"[inkbridge] seed load failed: {e}", file=sys.stderr)
+        return None
+
+
+class Backend:
+    def __init__(self, socket_path):
+        # AppLoad's socket is SOCK_SEQPACKET (message-framed). The 8-byte header and the payload
+        # are sent and received as SEPARATE messages (one send/recv each).
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.connect(socket_path)
+        self.lock = threading.Lock()
+        self.running = True
+        self.control_up = False
+
+    # ── AppLoad frontend framing (SEQPACKET: header msg, then payload msg) ──
+    def send_frontend(self, msg_type, obj):
+        payload = json.dumps(obj).encode("utf-8")
+        with self.lock:
+            try:
+                self.sock.send(HEADER.pack(msg_type, len(payload)))
+                if payload:
+                    self.sock.send(payload)
+            except Exception as e:
+                print(f"[inkbridge] frontend send error: {e}", file=sys.stderr)
+
+    def listen_frontend(self):
+        while self.running:
+            try:
+                head = self.sock.recv(HEADER.size)
+            except Exception:
+                break
+            if not head or len(head) < HEADER.size:
+                break
+            msg_type, length = HEADER.unpack(head)
+            payload = self.sock.recv(length) if length else b""
+            if msg_type == SYS_TERMINATE:
+                break
+            if msg_type == SYS_NEW_COORDINATOR:
+                continue
+            if msg_type == MSG_GET_CONFIG:
+                seed = load_seed()
+                if seed:
+                    self.send_frontend(MSG_CONFIG, seed)
+            elif msg_type == MSG_GET_STATUS:
+                if not self.control_up:
+                    self.send_frontend(MSG_STATUS, {"connected": False, "latency_ms": -1, "rate_hz": 0})
+        self.running = False
+
+    # ── daemon control subscriber ──
+    def listen_control(self):
+        while self.running:
+            c = None
+            try:
+                c = socket.create_connection((CONTROL_HOST, CONTROL_PORT), timeout=5)
+                c.sendall(b"IBCS\n")
+                self.control_up = True
+                print("[inkbridge] subscribed to daemon control :9293", file=sys.stderr)
+                buf = b""
+                while self.running:
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            msg = json.loads(line.decode("utf-8"))
+                        except json.JSONDecodeError:
+                            continue
+                        t = msg.get("type", "")
+                        data = msg.get("data", {})
+                        if t == "config":
+                            self.send_frontend(MSG_CONFIG, data)
+                        elif t == "status":
+                            self.send_frontend(MSG_STATUS, data)
+            except Exception as e:
+                print(f"[inkbridge] control link down ({e}); retrying", file=sys.stderr)
+            finally:
+                if self.control_up:
+                    self.control_up = False
+                    self.send_frontend(MSG_STATUS, {"connected": False, "latency_ms": -1, "rate_hz": 0})
+                if c:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            time.sleep(2)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: entry <socket_path>  (run by AppLoad)", file=sys.stderr)
+        sys.exit(1)
+    backend = Backend(sys.argv[1])
+    threading.Thread(target=backend.listen_control, daemon=True).start()
+    backend.listen_frontend()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+[Unit]
+Description=inkbridge daemon - rMPP pen digitizer to TCP for Windows tablet input
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/home/root/inkbridge/inkbridge-daemon
+Restart=always
+RestartSec=2
+# Safety net: drop the wakelock if the daemon stops (we never pause xochitl anymore,
+# so there is nothing to resume — only the opportunistic-suspend wakelock to release).
+ExecStopPost=/bin/sh -c 'echo inkbridge > /sys/power/wake_unlock 2>/dev/null; true'
+
+[Install]
+WantedBy=multi-user.target
