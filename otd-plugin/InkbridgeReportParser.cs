@@ -29,6 +29,7 @@ namespace Inkbridge
                 Tilt = new Vector2(p.TiltX / 100f, p.TiltY / 100f), // centideg -> deg
                 NearProximity = (p.Buttons & PenPacket.BtnToolPen) != 0,
                 HoverDistance = p.Distance,
+                Eraser = (p.Buttons & PenPacket.BtnEraser) != 0,
             };
         }
     }

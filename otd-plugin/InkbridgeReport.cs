@@ -6,9 +6,10 @@ namespace Inkbridge
     /// <summary>
     /// A single decoded pen report. Implements every report facet OTD's pipeline
     /// inspects: absolute position + pressure + buttons (ITabletReport), tilt
-    /// (ITiltReport), and hover/proximity (IProximityReport).
+    /// (ITiltReport), hover/proximity (IProximityReport), and eraser state
+    /// (IEraserReport).
     /// </summary>
-    public class InkbridgeReport : ITabletReport, ITiltReport, IProximityReport
+    public class InkbridgeReport : ITabletReport, ITiltReport, IProximityReport, IEraserReport
     {
         public byte[] Raw { get; set; } = System.Array.Empty<byte>();
 
@@ -23,5 +24,8 @@ namespace Inkbridge
         // IProximityReport
         public bool NearProximity { get; set; }
         public uint HoverDistance { get; set; }
+
+        // IEraserReport (Marker Plus flipped to the eraser end -> BTN_TOOL_RUBBER)
+        public bool Eraser { get; set; }
     }
 }

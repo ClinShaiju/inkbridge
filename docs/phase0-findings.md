@@ -57,6 +57,14 @@ Properties: (none)   # NOT marked INPUT_PROP_DIRECT/POINTER
 - **Pressure range is 0..4096** (4097 levels, ~12-bit) — note the plan said `0..4095`. The
   max is **4096**, not 4095. Use `u16`.
 - **Eraser tool exists** — `BTN_TOOL_RUBBER`. Not in the original plan; expose it as a flag.
+  **Verified the eraser end also reports live tilt** (evtest capture, 2026-06-04): during a
+  ~19 s window with `BTN_TOOL_RUBBER` active, the digitizer emitted 812 `ABS_TILT_X` + 821
+  `ABS_TILT_Y` events with continuously-varying values (e.g. −38.7°…−18.9°), not a frozen
+  last-pen value — alongside `ABS_X/Y`, `ABS_DISTANCE`, and `ABS_PRESSURE`. So tilt/hover/
+  pressure all flow for the eraser end exactly as for the pen. inkbridge's tilt path is
+  tool-agnostic (`packet.rs` captures `ABS_TILT_X/Y` regardless of active tool), so eraser
+  tilt is forwarded end-to-end with no daemon change; only the OTD plugin needed wiring
+  (`InkbridgeReport : IEraserReport` + mapping `BtnEraser` in the parser).
 - Both stylus buttons present (`BTN_STYLUS`, `BTN_STYLUS2`).
 - **Resolution fields are unreliable.** `res 2832` for X over a ~157 mm edge would imply
   ~3.9 mm of travel — physically wrong. Do **not** trust the evdev `resolution` field for
