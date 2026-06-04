@@ -17,6 +17,9 @@ appload/resources.rcc
 __pycache__/
 *.py[cod]
 
+# Release staging / packaged zips
+dist/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

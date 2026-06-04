@@ -21,7 +21,7 @@
 
 inkbridge streams the rMPP's pen digitizer over the USB cable into
 [OpenTabletDriver](https://opentabletdriver.net/) (OTD), so the tablet acts as a real graphics
-tablet on a Windows PC — position, **4096-level pressure**, hover, tilt, eraser, and pen buttons.
+tablet on a Windows PC — position, **4096-level pressure**, hover, tilt, and eraser.
 You get OTD's area mapping, pressure-curve editor, and button bindings for free, and pressure
 reaches Windows Ink / WinTab apps like Krita, Clip Studio, and Photoshop.
 
@@ -37,18 +37,21 @@ requires root SSH access to your device; use at your own risk.
 ## How it works
 
 ```
-reMarkable Paper Pro (USB)                         Windows PC
-┌───────────────────────────┐                ┌──────────────────────────────┐
-│ inkbridge-daemon (Rust)    │   TCP :9292    │ inkbridge OTD plugin (C#)     │
-│  reads /dev/input/event2   │ ─────packets──▶│  decodes PenPacket, feeds OTD │
-│  (pen), holds a wakelock   │                │            │                  │
-│  18-byte PenPacket / report│   TCP :9293    │            ▼                  │
-│                            │ ◀──status/area─│  OpenTabletDriver pipeline    │
-│ appload visualizer (QML)   │   (control)    │   area map · pressure curve   │
-│  read-only on-device box   │                │   · Windows Ink (VMulti)      │
-└───────────────────────────┘                │            ▼                  │
-                                              │   Krita / Clip Studio / …     │
-                                              └──────────────────────────────┘
+  reMarkable Paper Pro (USB)                      Windows PC
+┌───────────────────────────┐        ┌───────────────────────────────┐
+│ inkbridge-daemon (Rust)   │        │ inkbridge OTD plugin (C#)     │
+│   reads the pen digitizer │  :9292 │   decodes PenPacket,          │
+│   (/dev/input/event2),    │──────▶ │   feeds OTD                   │
+│   holds a wakelock, never │  (pen) │       |                       │
+│   pauses xochitl          │        │       v                       │
+│   18-byte PenPacket/report│  :9293 │ OpenTabletDriver pipeline     │
+│                           │◀────── │   area map / pressure         │
+│ appload visualizer (QML)  │ status │   curve / Windows Ink         │
+│   read-only on-device box │  /area │   output via VMulti           │
+│                           │        │       |                       │
+│                           │        │       v                       │
+│                           │        │ Krita / Clip Studio / ...     │
+└───────────────────────────┘        └───────────────────────────────┘
 ```
 
 - The **daemon** on the tablet reads the Elan pen digitizer (~480–500 Hz) and streams a compact
@@ -72,74 +75,68 @@ reMarkable Paper Pro (USB)                         Windows PC
 
 ## Getting started
 
-Using the prebuilt binaries from the [latest release](../../releases/latest). To build them
-yourself instead, see [Building from source](#building-from-source).
+Download **`inkbridge-windows.zip`** from the [latest release](../../releases/latest) and unzip it,
+then run the installer — or do it by hand. To build the binaries yourself instead, see
+[Building from source](#building-from-source).
 
-You'll need two prebuilt files from the release — `inkbridge-daemon` (the tablet binary) and
-`Inkbridge.dll` (the OTD plugin) — plus this repo for the scripts and config files.
+### Quick install (recommended)
 
-**1. Clone the repo and set your device password**
+1. **Set the tablet password** *(only needed if you let the installer push the daemon over SSH)* —
+   copy `.env.example` to `.env` and set `INKBRIDGE_PW` to your device's root SSH password (on the
+   tablet: **Settings → Help → Copyrights and licenses**, at the bottom).
+2. **Run `install.cmd`** — just double-click it (or run `install.cmd /daemon` from a terminal to
+   also install the on-tablet daemon over SSH). It:
+   - copies the OTD plugin + tablet config into `%LOCALAPPDATA%\OpenTabletDriver`,
+   - auto-detects your OpenTabletDriver folder and remembers it (OTD is extract-and-run, so the
+     path varies — it's saved as the `OTD_DIR` env var for `start-inkbridge.cmd`),
+   - optionally installs the daemon on the reMarkable,
+   - then prints the two manual pieces below.
+3. **Install the pressure pieces** (OTD has no built-in pressure on Windows):
+   - **VMulti driver** — the X9VoiD fork: <https://github.com/X9VoiD/vmulti-bin/releases/latest>
+     (if an XP-Pen "Pentablet HID" VMulti is already present, let the X9VoiD installer replace it).
+   - **Windows Ink plugin** — in OTD's **Plugin Manager**, install **VoiDPlugins / Windows Ink**.
+4. **Enable inkbridge in OTD** — enable the **inkbridge** tool (`Inkbridge.InkbridgeTool`) and
+   **apply settings twice** (the first apply registers the device; the second binds the output mode —
+   by design, see `otd-plugin/InkbridgeTool.cs`). Set the output mode to **Windows Ink Absolute
+   Mode** and bind the pen tip to the Windows Ink **"Pen Tip"** handler (not the stock "Tip"), or
+   pressure won't register.
+5. **Run it** — `start-inkbridge.cmd`. Draw on the reMarkable; the cursor tracks the pen with
+   pressure. Stop with `stop-inkbridge.cmd`.
 
-```powershell
-git clone https://github.com/ClinShaiju/inkbridge.git
-cd inkbridge
-Copy-Item .env.example .env
-# edit .env and set INKBRIDGE_PW to your device's root SSH password
-# (on the tablet: Settings > Help > Copyrights and licenses, at the bottom)
-```
+> No tablet handy? Set `INKBRIDGE_SYNTHETIC=1` in OTD's environment and the plugin drives a
+> built-in oscillating-pressure source — a quick way to confirm the Windows Ink / pressure path.
 
-**2. Install the daemon on the tablet** (place the downloaded `inkbridge-daemon` in the repo root first)
+### Manual install
+
+The installer just automates these — do them by hand if you prefer.
+
+**Daemon (on the tablet)** — needs the OpenSSH client; you'll be asked for the device password
+unless you use an SSH key:
 
 ```powershell
 $dev = "root@10.11.99.1"
 ssh $dev "mkdir -p /home/root/inkbridge"
-scp inkbridge-daemon daemon/inkbridge-daemon.service daemon/install-service.sh ${dev}:/home/root/inkbridge/
+scp inkbridge-daemon inkbridge-daemon.service install-service.sh ${dev}:/home/root/inkbridge/
 ssh $dev "chmod +x /home/root/inkbridge/inkbridge-daemon /home/root/inkbridge/install-service.sh && sh /home/root/inkbridge/install-service.sh"
 ```
 
-This installs `inkbridge-daemon` as a systemd service listening on `:9292` (pen) and `:9293`
-(control). Re-run `install-service.sh` after a reMarkable software update — updates reset the
-rootfs the unit lives on.
+(In a repo checkout the service files are under `daemon/`.) This installs the daemon as a systemd
+service on `:9292` (pen) and `:9293` (control). Re-run `install-service.sh` after a reMarkable
+software update — updates reset the rootfs the unit lives on.
 
-**3. Install the OTD plugin** (place the downloaded `Inkbridge.dll` in the repo root first; close OTD)
+**OTD plugin (on Windows)** — close OTD first:
 
 ```powershell
 $otd = "$env:LOCALAPPDATA\OpenTabletDriver"
 New-Item -ItemType Directory -Force "$otd\Plugins\Inkbridge" | Out-Null
 Copy-Item Inkbridge.dll "$otd\Plugins\Inkbridge\"
-Copy-Item otd-plugin\tablet-spec.json "$otd\Configurations\inkbridge.json"
+Copy-Item tablet-spec.json "$otd\Configurations\inkbridge.json"   # otd-plugin\tablet-spec.json in a repo checkout
 ```
 
-**4. Install the Windows pressure pieces** (OTD has no built-in pressure on Windows)
+Then do steps 3–5 of the quick install above. If `start-inkbridge.cmd` can't find OpenTabletDriver,
+point it at the folder:  `setx OTD_DIR "C:\path\to\OpenTabletDriver"`.
 
-- **VMulti driver** — install the X9VoiD fork from
-  <https://github.com/X9VoiD/vmulti-bin/releases/latest>. If another vendor's VMulti is present
-  (e.g. an XP-Pen "Pentablet HID"), let the X9VoiD installer replace it.
-- **Windows Ink plugin** — in OTD's **Plugin Manager**, install **VoiDPlugins / Windows Ink**.
-
-**5. Enable the plugin and turn on pressure**
-
-1. Start OpenTabletDriver and enable the **inkbridge** tool (`Inkbridge.InkbridgeTool`).
-2. **Apply settings, then apply settings a second time.** The first apply registers the device;
-   the second binds the output mode to it (by design — see `otd-plugin/InkbridgeTool.cs`). After
-   the second apply, OTD should show the **inkbridge rMPP** tablet with live input.
-3. Set the output mode to **Windows Ink Absolute Mode** and bind the pen tip to the **Windows Ink**
-   tip handler ("Pen Tip"), not the stock "Tip" — otherwise pressure won't register.
-
-**6. Run it**
-
-```powershell
-$env:OTD_DIR = "C:\path\to\OpenTabletDriver"   # if not C:\OpenTabletDriver
-.\start-inkbridge.cmd
-```
-
-Draw on the reMarkable — the Windows cursor tracks the pen with pressure. To stop:
-`.\stop-inkbridge.cmd`.
-
-> No tablet handy? Set `INKBRIDGE_SYNTHETIC=1` in OTD's environment and the plugin drives a
-> built-in oscillating-pressure source — a quick way to confirm the Windows Ink / pressure path.
-
-**Optional — the on-device visualizer:** with XOVI + `rm-appload` installed on the tablet, run
+**On-device visualizer (optional):** with XOVI + `rm-appload` installed on the tablet, run
 `python appload/deploy.py` (needs `pip install paramiko PySide6`) to deploy the read-only
 active-area overlay, then launch **inkbridge** from the AppLoad menu.
 

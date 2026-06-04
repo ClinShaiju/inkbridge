@@ -1,0 +1,40 @@
+inkbridge - Windows release
+===========================
+
+Use a reMarkable Paper Pro as a pressure-sensitive drawing tablet on Windows.
+Full docs: https://github.com/ClinShaiju/inkbridge
+
+WHAT'S IN THIS ZIP
+  install.cmd                 one-click Windows setup (just run it)
+  start-inkbridge.cmd         start drawing (launches OpenTabletDriver + applies settings)
+  stop-inkbridge.cmd          stop
+  Inkbridge.dll               the OpenTabletDriver plugin
+  tablet-spec.json            OTD tablet descriptor
+  mouse-mode-settings.json    a ready-made OTD profile
+  inkbridge-daemon            the tablet binary (runs on the reMarkable)
+  inkbridge-daemon.service    systemd unit for the tablet
+  install-service.sh          installs the daemon as a service on the tablet
+  .env.example                copy to .env and set your device's SSH password
+  appload\                    optional read-only on-device visualizer
+
+BEFORE YOU START
+  - reMarkable Paper Pro with developer/root SSH, connected by USB (reachable at 10.11.99.1).
+  - OpenTabletDriver 0.6.7 on this PC: https://opentabletdriver.net/
+
+QUICK START
+  1. (Optional, for the SSH daemon install) copy .env.example to .env and set INKBRIDGE_PW
+     to your device's root password (tablet: Settings > Help > Copyrights and licenses, bottom).
+  2. Double-click install.cmd   (or run "install.cmd /daemon" in a terminal to also install
+     the daemon on the tablet over SSH). It installs the OTD plugin and finds OpenTabletDriver.
+  3. Install the two pressure pieces it tells you about:
+       - VMulti driver:  https://github.com/X9VoiD/vmulti-bin/releases/latest
+       - Windows Ink:    OpenTabletDriver > Plugin Manager > "VoiDPlugins / Windows Ink"
+  4. In OpenTabletDriver: enable the "inkbridge" tool (Inkbridge.InkbridgeTool), APPLY SETTINGS
+     TWICE, set output mode to "Windows Ink Absolute Mode", and bind the pen tip to the
+     Windows Ink "Pen Tip" handler.
+  5. Run start-inkbridge.cmd and draw. Stop with stop-inkbridge.cmd.
+
+If OpenTabletDriver isn't found, point to it:  setx OTD_DIR "C:\path\to\OpenTabletDriver"
+
+The reMarkable keeps working normally while connected - you'll just see ink on the e-ink as you
+draw. That's cosmetic and harmless.
