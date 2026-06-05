@@ -23,11 +23,12 @@
 mod control;
 mod orientation;
 mod packet;
+mod touch;
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,9 +48,30 @@ const KEEPALIVE: Duration = Duration::from_millis(16);
 /// each connection in its own thread (instead of a single-client accept loop) lets that
 /// transient succeed cleanly instead of triggering a broken-pipe/reconnect storm. Two
 /// concurrent evdev readers on event2 is fine — there is no grab, so each gets all events.
+/// Shared with the touch listener (`touch.rs`) so a pen OR touch client keeps the device awake.
 #[derive(Default)]
-struct WakeRefcount {
+pub(crate) struct WakeRefcount {
     clients: u32,
+}
+
+/// First client in: hold the device awake so autosleep doesn't power down the digitizer.
+pub(crate) fn client_in(refc: &Arc<Mutex<WakeRefcount>>) {
+    let mut r = refc.lock().unwrap();
+    r.clients += 1;
+    if r.clients == 1 {
+        wakelock(true);
+        log("wakelock acquired (first client)");
+    }
+}
+
+/// Last client out: release the wakelock and let the device sleep.
+pub(crate) fn client_out(refc: &Arc<Mutex<WakeRefcount>>) {
+    let mut r = refc.lock().unwrap();
+    r.clients = r.clients.saturating_sub(1);
+    if r.clients == 0 {
+        wakelock(false);
+        log("wakelock released (last client gone)");
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -61,8 +83,9 @@ fn main() -> std::io::Result<()> {
 
     // Start the control plane (TCP :9293) for the on-device visualizer. It relays the area config
     // + link status pushed by the OTD plugin (PC side) and broadcasts "disconnected" when the
-    // plugin heartbeat goes stale. Own threads; never touches the pen stream below.
-    control::spawn();
+    // plugin heartbeat goes stale. Own threads; never touches the pen stream below. Returns the
+    // on-device-app subscriber count, used to gate touch passthrough to "AppLoad app is open".
+    let app_subs = control::spawn();
 
     // Detect screen orientation (accelerometer + xochitl lock) and publish it; the pen
     // stream below stamps it into every packet so OTD can rotate the area to match.
@@ -70,37 +93,34 @@ fn main() -> std::io::Result<()> {
 
     let refc = Arc::new(Mutex::new(WakeRefcount::default()));
 
+    // Pen-priority palm rejection: the pen stream sets this true while the pen/eraser is in range;
+    // the touch stream suppresses touch while it's set, so a palm resting on the screen during
+    // drawing doesn't register as touches.
+    let pen_in_range = Arc::new(AtomicBool::new(false));
+
+    // Touch passthrough listener (:9294), independent of the pen stream. Reads event3 only
+    // while a client is connected; shares the wakelock refcount and the orientation cell, gates
+    // streaming on the AppLoad app being open (app_subs) unless the client opts out, and suppresses
+    // touch while the pen is in range (pen_in_range).
+    touch::spawn(Arc::clone(&refc), Arc::clone(&orient), app_subs, Arc::clone(&pen_in_range));
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let peer = stream.peer_addr().ok();
                 let refc = Arc::clone(&refc);
                 let orient = Arc::clone(&orient);
+                let pen_in_range = Arc::clone(&pen_in_range);
                 thread::spawn(move || {
-                    // First client in: hold the device awake so autosleep doesn't power
-                    // down the digitizer. xochitl is left running (no grab; pausing it
-                    // would reboot the device).
-                    {
-                        let mut r = refc.lock().unwrap();
-                        r.clients += 1;
-                        if r.clients == 1 {
-                            wakelock(true);
-                            log("wakelock acquired (first client)");
-                        }
-                    }
+                    // Hold the device awake so autosleep doesn't power down the digitizer.
+                    // xochitl is left running (no grab; pausing it would reboot the device).
+                    client_in(&refc);
                     log(&format!("client connected: {peer:?}"));
-                    if let Err(e) = handle_client(stream, &orient) {
+                    if let Err(e) = handle_client(stream, &orient, &pen_in_range) {
                         log(&format!("session ended: {e}"));
                     }
-                    // Last client out: release the wakelock and let the device sleep.
-                    {
-                        let mut r = refc.lock().unwrap();
-                        r.clients = r.clients.saturating_sub(1);
-                        if r.clients == 0 {
-                            wakelock(false);
-                            log("wakelock released (last client gone)");
-                        }
-                    }
+                    pen_in_range.store(false, Ordering::Relaxed); // pen client gone → unblock touch
+                    client_out(&refc);
                     log("client disconnected");
                 });
             }
@@ -111,15 +131,23 @@ fn main() -> std::io::Result<()> {
 }
 
 /// One client session: send hello, then stream until the socket breaks.
-fn handle_client(mut stream: TcpStream, orient: &AtomicU8) -> std::io::Result<()> {
+fn handle_client(
+    mut stream: TcpStream,
+    orient: &AtomicU8,
+    pen_in_range: &AtomicBool,
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?; // latency over throughput
     stream.write_all(b"IBR1")?; // protocol hello (version 1)
-    stream_pen(&mut stream, orient)
+    stream_pen(&mut stream, orient, pen_in_range)
 }
 
 /// Open the pen device and stream PenPackets until the socket write fails (client gone)
 /// or the device read errors.
-fn stream_pen(stream: &mut TcpStream, orient: &AtomicU8) -> std::io::Result<()> {
+fn stream_pen(
+    stream: &mut TcpStream,
+    orient: &AtomicU8,
+    pen_in_range: &AtomicBool,
+) -> std::io::Result<()> {
     let mut dev = match find_pen() {
         Some(d) => d,
         None => {
@@ -176,6 +204,8 @@ fn stream_pen(stream: &mut TcpStream, orient: &AtomicU8) -> std::io::Result<()> 
                             EventType::KEY => state.update_key(code, val),
                             EventType::SYNCHRONIZATION => {
                                 if code == 0 {
+                                    // Publish pen proximity for the touch stream's palm rejection.
+                                    pen_in_range.store(state.in_range(), Ordering::Relaxed);
                                     let ts = start.elapsed().as_micros() as u32;
                                     state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
                                     stream.write_all(&buf)?; // Err = client disconnected
@@ -227,6 +257,6 @@ fn wakelock(acquire: bool) {
     let _ = std::fs::write(path, WAKELOCK_TAG);
 }
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     eprintln!("[inkbridge] {msg}");
 }

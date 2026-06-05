@@ -16,6 +16,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,20 +40,27 @@ struct Hub {
 }
 
 /// Start the control plane (listener + staleness broadcaster) in their own threads.
-pub fn spawn() {
+/// Returns a counter of currently-connected on-device app subscribers (`IBCS`). The touch
+/// stream uses this as the "AppLoad app is open" signal to gate touch passthrough.
+pub fn spawn() -> Arc<AtomicUsize> {
     let hub = Arc::new(Mutex::new(Hub::default()));
+    let app_subs = Arc::new(AtomicUsize::new(0));
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || broadcast_loop(hub));
     }
-    thread::spawn(move || {
-        if let Err(e) = run(hub) {
-            crate::log(&format!("control plane stopped: {e}"));
-        }
-    });
+    {
+        let app_subs = Arc::clone(&app_subs);
+        thread::spawn(move || {
+            if let Err(e) = run(hub, app_subs) {
+                crate::log(&format!("control plane stopped: {e}"));
+            }
+        });
+    }
+    app_subs
 }
 
-fn run(hub: Arc<Mutex<Hub>>) -> std::io::Result<()> {
+fn run(hub: Arc<Mutex<Hub>>, app_subs: Arc<AtomicUsize>) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT))?;
     crate::log(&format!("control plane listening on 0.0.0.0:{CONTROL_PORT}"));
     for incoming in listener.incoming() {
@@ -61,8 +69,9 @@ fn run(hub: Arc<Mutex<Hub>>) -> std::io::Result<()> {
             Err(_) => continue,
         };
         let hub = Arc::clone(&hub);
+        let app_subs = Arc::clone(&app_subs);
         thread::spawn(move || {
-            if let Err(e) = handle(stream, hub) {
+            if let Err(e) = handle(stream, hub, app_subs) {
                 crate::log(&format!("control client ended: {e}"));
             }
         });
@@ -87,13 +96,13 @@ fn broadcast_loop(hub: Arc<Mutex<Hub>>) {
     }
 }
 
-fn handle(stream: TcpStream, hub: Arc<Mutex<Hub>>) -> std::io::Result<()> {
+fn handle(stream: TcpStream, hub: Arc<Mutex<Hub>>, app_subs: Arc<AtomicUsize>) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut role = String::new();
     reader.read_line(&mut role)?;
     match role.trim() {
-        "IBCS" => handle_subscriber(stream, reader, hub),
+        "IBCS" => handle_subscriber(stream, reader, hub, app_subs),
         "IBCP" => handle_publisher(stream, reader, hub),
         "" => Ok(()), // throwaway/probe connection — ignore silently
         other => {
@@ -108,6 +117,7 @@ fn handle_subscriber(
     stream: TcpStream,
     mut reader: BufReader<TcpStream>,
     hub: Arc<Mutex<Hub>>,
+    app_subs: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     {
         let mut h = hub.lock().unwrap();
@@ -120,6 +130,10 @@ fn handle_subscriber(
         h.subs.push(w);
         crate::log(&format!("control: subscriber joined ({} total)", h.subs.len()));
     }
+    // An on-device app subscriber being connected == the AppLoad app is open. The touch stream
+    // reads this to gate passthrough (touch only flows while the app is open, unless overridden).
+    let n = app_subs.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::log(&format!("control: app present (subscribers={n})"));
     let mut line = String::new();
     loop {
         line.clear();
@@ -128,6 +142,8 @@ fn handle_subscriber(
             Ok(_) => {}
         }
     }
+    let left = app_subs.fetch_sub(1, Ordering::Relaxed) - 1;
+    crate::log(&format!("control: app gone (subscribers={left})"));
     Ok(())
 }
 
