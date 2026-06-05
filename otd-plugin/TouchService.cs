@@ -69,9 +69,9 @@ namespace Inkbridge
             int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_TOUCH_PORT"), out var p) ? p : Port;
 
         /// <summary>
-        /// Apply the selected mode + options. No-op if nothing changed; otherwise restart the worker.
-        /// <paramref name="rotation"/>: -1 = follow device orientation, else 0/1/2/3 = 0/90/180/270°.
-        /// <paramref name="alwaysOn"/>: stream even when the on-device AppLoad app is closed.
+        /// Apply the selected <paramref name="mode"/> + <paramref name="opts"/>. No-op if nothing
+        /// changed; otherwise (re)start the reader worker. See <see cref="TouchOptions"/> for the
+        /// rotation / monitor / palm-rejection / always-on fields.
         /// </summary>
         public void SetMode(TouchMode mode, TouchOptions opts)
         {
@@ -128,7 +128,7 @@ namespace Inkbridge
             }
             else
             {
-                consumer = new TouchGestures(tapOnly: false);
+                consumer = new TouchGestures();
             }
 
             var buf = new byte[TouchPacket.Size];

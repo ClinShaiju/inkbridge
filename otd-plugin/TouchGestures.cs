@@ -13,8 +13,8 @@ namespace Inkbridge
     /// Vocabulary (defaults; tune the thresholds on-device):
     ///   • 2-finger tap            → Ctrl+Z  (undo)
     ///   • 3-finger tap            → Ctrl+Y  (redo)
-    ///   • 2-finger pinch in/out   → Ctrl + wheel  (zoom)        [skipped in tap-only mode]
-    ///   • 2-finger drag (vert)    → wheel scroll                [skipped in tap-only mode]
+    ///   • 2-finger pinch in/out   → Ctrl + wheel  (zoom)
+    ///   • 2-finger drag (vert)    → wheel scroll
     ///
     /// An "episode" runs from the first finger down to the last finger up. A tap is an episode that
     /// is short and in which no finger moved far FROM ITS OWN landing point — measuring per-contact
@@ -29,12 +29,6 @@ namespace Inkbridge
         private const double ScrollStep = 90;   // centroid vertical move per emitted wheel tick
         private const double TapMoveTol = 130;  // max per-finger travel still counted as a tap (~11mm)
         private const long TapMaxMs = 450;      // max episode duration still counted as a tap
-
-        // When true, only fire discrete multi-finger taps and skip continuous pinch/scroll (Direct
-        // touch already gives native pinch/pan; re-emitting would double up).
-        private readonly bool _tapOnly;
-
-        public TouchGestures(bool tapOnly) => _tapOnly = tapOnly;
 
         // Per-slot contact tracking.
         private readonly bool[] _down = new bool[Slots];
@@ -100,7 +94,7 @@ namespace Inkbridge
             }
             _maxCount = Math.Max(_maxCount, count);
 
-            if (!_tapOnly && count == 2)
+            if (count == 2)
             {
                 double cy = cySum / count;
                 double spread = Dist(ax, ay, bx, by);
