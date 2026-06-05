@@ -25,14 +25,19 @@ tablet on a Windows PC — position, **4096-level pressure**, hover, tilt, and e
 You get OTD's area mapping, pressure-curve editor, and button bindings for free, and pressure
 reaches Windows Ink / WinTab apps like Krita, Clip Studio, and Photoshop.
 
+It also passes the rMPP's **10-finger touchscreen** through to Windows — as genuine multitouch
+(pinch-zoom / pan) or as multi-finger gesture shortcuts (undo / redo / zoom / scroll) — with
+pen-priority palm rejection so a resting hand doesn't register while you draw.
+
 No kernel driver, no driver signing, no e-ink hacking. The reMarkable keeps running normally while
 you draw on it.
 
 ## Status
 
 This is a **working prototype** and an unofficial hobby project — it is **not affiliated with
-reMarkable**. The core path (pen → pressure-sensitive strokes in Krita) is built and verified. It
-requires root SSH access to your device; use at your own risk.
+reMarkable**. The core path (pen → pressure-sensitive strokes in Krita) is built and verified, as
+is touch passthrough (direct multitouch / gestures, off by default). It requires root SSH access to
+your device; use at your own risk.
 
 ## How it works
 
@@ -46,8 +51,12 @@ requires root SSH access to your device; use at your own risk.
 |   pauses xochitl          |        |       v                       |
 |   18-byte PenPacket/report|  :9293 | OpenTabletDriver pipeline     |
 |                           | <----- |   area map / pressure         |
-| appload visualizer (QML)  | status |   curve / Windows Ink         |
-|   read-only on-device box |  /area |   output via VMulti           |
+|   reads the touchscreen   | status |   curve / Windows Ink         |
+|   (/dev/input/event3),    |  /area |   output via VMulti           |
+|   88-byte TouchPacket     |  :9294 |       ^                       |
+|                           | -----> |   touch → InjectTouchInput    |
+| appload visualizer (QML)  |(touch) |       or gesture shortcuts    |
+|   read-only on-device box |        |       |                       |
 |                           |        |       |                       |
 |                           |        |       v                       |
 |                           |        | Krita / Clip Studio / ...     |
@@ -61,6 +70,11 @@ requires root SSH access to your device; use at your own risk.
 - The **OTD plugin** registers a synthetic, network-sourced tablet inside OpenTabletDriver, decodes
   the packets, and feeds position/pressure/tilt/hover/buttons into OTD's pipeline. It also publishes
   link status + the active area back to the tablet.
+- **Touch passthrough** (optional, off by default) streams the rMPP's 10-finger digitizer on a
+  separate port (:9294) as an 88-byte `TouchPacket` per report. The plugin turns it into either
+  genuine Windows multitouch (`InjectTouchInput`) or PC-side gesture recognition (keystrokes /
+  wheel). It's gated on the on-device app being open and on pen-priority palm rejection, so touch
+  only reaches Windows when you want it. See [`docs/touch-modes.md`](docs/touch-modes.md).
 - The optional **appload visualizer** draws the configured active-area box on the e-ink surface so
   you can see where the pen is "live", plus connection/latency/rate stats. It is read-only — OTD on
   the PC owns all configuration.
@@ -115,9 +129,6 @@ then run the installer — or do it by hand. To build the binaries yourself inst
 > cursor/mouse-mode profile (raw absolute cursor — handy for osu!-style use rather than pressure
 > drawing); `stop-inkbridge.cmd` closes OTD. For normal pressure drawing you don't need either —
 > just launch OpenTabletDriver.
-
-> No tablet handy? Set `INKBRIDGE_SYNTHETIC=1` in OTD's environment and the plugin drives a
-> built-in oscillating-pressure source — a quick way to confirm the Windows Ink / pressure path.
 
 ### Manual install
 
@@ -198,10 +209,10 @@ Install it as in [Getting started](#getting-started) step 3.
 
 | Path | What it is |
 |------|-----------|
-| [`daemon/`](daemon/) | Rust daemon for the rMPP — evdev pen reader, TCP pen stream (:9292) + control plane (:9293), systemd unit, deploy script. |
-| [`otd-plugin/`](otd-plugin/) | C# / .NET 8 OpenTabletDriver 0.6.7 plugin — synthetic tablet device, packet decoder, report parser, PC-side telemetry, tablet config. |
+| [`daemon/`](daemon/) | Rust daemon for the rMPP — evdev pen + touch readers, TCP pen stream (:9292), control plane (:9293), touch stream (:9294), systemd unit, deploy script. |
+| [`otd-plugin/`](otd-plugin/) | C# / .NET 8 OpenTabletDriver 0.6.7 plugin — synthetic tablet device, packet decoder, report parser, touch passthrough (multitouch + gestures), PC-side telemetry, tablet config. |
 | [`appload/`](appload/) | On-device AppLoad app — QML frontend + Python backend; read-only active-area visualizer. |
-| [`protocol/`](protocol/) | `packet.md` — authoritative PenPacket wire spec. |
+| [`protocol/`](protocol/) | `packet.md` — authoritative PenPacket wire spec; `touch-packet.md` — TouchPacket wire spec. |
 | [`tools/`](tools/) | Diagnostic scripts (pen probe, rate/tilt/button checks, HID diag) from bring-up. |
 | [`docs/`](docs/) | Verified device facts, architecture audit, and AppLoad design notes. |
 | [`PROJECT.md`](PROJECT.md) | Original design plan + audit brief, with an "as-built" status section. |
@@ -218,8 +229,8 @@ INKBRIDGE_USER=root
 INKBRIDGE_PW=your-device-password
 ```
 
-The OTD plugin and daemon also honor `INKBRIDGE_HOST` / `INKBRIDGE_PORT`; `INKBRIDGE_SYNTHETIC=1`
-enables the host-only pressure test source.
+The OTD plugin and daemon also honor `INKBRIDGE_HOST` / `INKBRIDGE_PORT` (pen) and
+`INKBRIDGE_TOUCH_PORT` (touch).
 
 ## Contributing
 
