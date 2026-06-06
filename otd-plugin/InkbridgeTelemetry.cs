@@ -101,6 +101,18 @@ namespace Inkbridge
             _reconnect.Reset(); // connected — reset the backoff schedule
             Log.Write("Inkbridge", $"telemetry connected to {host}:{ControlPort} (authenticated, encrypted)");
 
+            // First encrypted record from the daemon is the beacon key (so BeaconListener can verify
+            // presence beacons). Store it; harmless if a future daemon omits it (we just retry reads).
+            try
+            {
+                var first = sess.ReadRecord(stream);
+                StoreBeaconKeyIfPresent(utf8.GetString(first));
+            }
+            catch (Exception e)
+            {
+                Log.Write("Inkbridge", $"beacon-key read failed: {e.Message}", LogLevel.Debug);
+            }
+
             DateTime lastWrite = default;
             PushConfigIfChanged(Send, ref lastWrite); // initial push
 
@@ -151,6 +163,30 @@ namespace Inkbridge
                      + latencyMs.ToString("F2", ci) + ",\"rate_hz\":" + rateHz.ToString("F0", ci) + "}}");
 
                 Thread.Sleep(1000);
+            }
+        }
+
+        /// <summary>Persist the device's beacon key (+id) from a {"type":"beaconkey",...} control message.</summary>
+        private static void StoreBeaconKeyIfPresent(string line)
+        {
+            if (!line.Contains("\"beaconkey\"")) return;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                string? key = root.TryGetProperty("key", out var k) ? k.GetString() : null;
+                string? id = root.TryGetProperty("id", out var i) ? i.GetString() : null;
+                if (string.IsNullOrEmpty(key)) return;
+                var cfg = PluginConfig.Load();
+                if (cfg.beacon_key == key) return; // unchanged
+                cfg.beacon_key = key;
+                if (!string.IsNullOrEmpty(id)) cfg.device_id = id;
+                cfg.Save();
+                Log.Write("Inkbridge", "stored device beacon key");
+            }
+            catch (Exception e)
+            {
+                Log.Write("Inkbridge", $"beacon-key parse failed: {e.Message}", LogLevel.Debug);
             }
         }
 
