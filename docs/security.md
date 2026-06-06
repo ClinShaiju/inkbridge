@@ -123,16 +123,21 @@ release."
    is a deliberate choice the user makes (and is told carries LAN exposure). This alone removes the
    accidental-exposure case entirely.
 
-2. **Pairing token = authentication + identity *(one mechanism, two problems)*.**
-   - **Bootstrap over USB** (the trusted channel): generate a shared **secret** + a stable
-     **device id** on first cable connect; persist the secret on the device
-     (`/home/root/inkbridge/identity`) and on the PC (`inkbridge.json` next to the DLL).
-   - **Require the token** on every channel handshake (`IBR1`/`IBT1`/`IBCP`/`IBCS` → carry an
-     HMAC/token line). **Reject unauthenticated connections immediately — before** `client_in()` /
-     thread work / wakelock.
-   - **Advertise only the id** (non-secret) in the beacon/mDNS TXT so the plugin **filters to its
-     paired device** → *PC1 ↔ rMPP1 only*, even with multiple rMPPs on the subnet (the SoC hostname
-     `imx8mm-ferrari` is identical across units and cannot disambiguate).
+2. **Pinned-key identity = authentication + identity *(one mechanism, two problems)*.** Following the
+   HomeKit/Matter/WireGuard pattern — discovery *locates*, a key *authenticates*:
+   - **Locator:** a random **UUIDv4** generated once on the device (`/home/root/inkbridge/identity`,
+     `0600`), advertised in the mDNS **TXT `id=`** so the plugin filters discovery to its paired
+     device → *PC1 ↔ rMPP1* among several. The id is **public/spoofable — not a credential** (the SoC
+     hostname `imx8mm-ferrari` is identical across units and can't disambiguate either; that's why we
+     mint our own). **Not MAC** (randomized, spoofable, hardware-leaking, differs per interface).
+   - **Identity:** a long-term **P-256 keypair** per side (native `ECDsa` on .NET 8; pure-Rust `p256`
+     on the daemon — Matter's choice). **Bootstrap over USB** (trusted, point-to-point): exchange and
+     **pin** public keys on first cable connect — PC stores `{id → device_pubkey}` in `inkbridge.json`,
+     daemon allow-lists the PC key (`/home/root/inkbridge/authorized_keys`).
+   - **Per-connection mutual signed-nonce challenge-response** on every handshake
+     (`IBR1`/`IBT1`/`IBCP`/`IBCS`): ECDSA over (nonce ‖ peer-nonce ‖ channel-tag). **Reject an
+     unknown/invalid signer immediately — before** `client_in()` / thread work / wakelock.
+   - A spoofed mDNS/beacon record then at worst causes a *failed* connect, never a capture.
    See [`wifi-connectivity-feasibility.md`](./wifi-connectivity-feasibility.md) §5.
 
 3. **Bound concurrency.** Cap connections per port (e.g. 2), rate-limit accepts, and **acquire the

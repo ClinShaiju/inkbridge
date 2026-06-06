@@ -152,17 +152,67 @@ sequence numbers + an app-level lifecycle to replace what TCP gives for free.
 | **Manual entry** | env var / `inkbridge.json` / OTD field | Always works as fallback | Defeats "automatic"; IP drifts | ✅ |
 | **USB-assisted handoff** | While plugged in, ask daemon over `:9293` for its wlan0 IP + identity, cache it | Reuses the **trusted** USB path to bootstrap Wi-Fi *and* exchange the pairing token (§5); exact, no multicast | Needs one initial cable connect | ✅ |
 
-**Recommendation (unchanged, strengthened):** **mDNS service discovery as primary**, but note we
-**already broadcast a beacon on `:9291`** — the cheapest first step is to **extend that beacon
-payload** to carry `IP:port` + a device id, and have the plugin's existing `BeaconListener`
-(`Reconnect.cs`) learn the address from it (it already validates `IBR1` and wakes parked links).
-That turns the beacon from "something changed, retry" into "something changed, here's where/who",
-reusing code that ships today. mDNS SRV/PTR is the more standards-friendly upgrade on top.
+### 4a. How everyday devices get discovered on a LAN
 
-Resolution chain in `TcpSource`:
+Worth grounding the choice in what cameras, phones, printers, and speakers actually do — because
+inkbridge is the same problem (a service that must be *found*, then *trusted*):
+
+- **mDNS / DNS-SD (Bonjour / Avahi)** — the dominant standard. AirPrint printers (`_ipp._tcp`),
+  Chromecast (`_googlecast._tcp`), AirPlay speakers (`_airplay._tcp` / `_raop._tcp`), HomeKit
+  accessories (`_hap._tcp`), Spotify Connect, most "smart home" gear. Each advertises
+  `_service._tcp.local` with **SRV** (host + port), **TXT** (metadata incl. a stable **id**), and
+  **A/AAAA** records. This is exactly the path we're implementing.
+- **SSDP / UPnP** — smart TVs, DLNA media servers, Sonos, routers, many consumer IP cameras.
+  Multicast `239.255.255.250:1900`, HTTP-over-UDP (`M-SEARCH` / `NOTIFY`); the device is described by
+  an XML doc at a URL and identified by a **UUID** in its USN (`uuid:2fac…::urn:…`).
+- **WS-Discovery (ONVIF)** — the standard for **IP/security cameras**. SOAP over multicast
+  `239.255.255.250:3702`; each camera has an endpoint-reference **UUID**.
+- **Cloud rendezvous + QR** — consumer phones/cameras often *don't* do pure-LAN discovery: you scan a
+  QR/8-digit code, a cloud broker introduces the peers, then they hole-punch a P2P link. (Out of
+  scope here — we're LAN-only and have USB as the introduction channel.)
+
+**The universal security lesson:** *discovery is never trusted to establish identity.* mDNS, SSDP,
+and WS-Discovery are all **unauthenticated and trivially spoofable** — anyone on the L2 can answer.
+So every serious system pairs discovery with an **out-of-band-bootstrapped cryptographic identity**:
+
+| System | Discovery | Identity / auth (the part that's actually trusted) |
+|---|---|---|
+| **Apple HomeKit (HAP)** | mDNS `_hap._tcp`, TXT `id=` | **SRP** seeded by an 8-digit setup code (OOB, printed/QR) → long-term **Ed25519** keypair per side; later sessions use the keys |
+| **Matter** | DNS-SD `_matterc._udp` (TXT discriminator) | passcode (QR/manual) commissioning → **CASE**: per-device **P-256** operational certs |
+| **Chromecast** | mDNS `_googlecast._tcp` | **TLS** with a device certificate |
+| **WireGuard** | (none — static endpoints) | **Curve25519 public-key pinning** (trust-on-first-use / manual exchange) |
+
+In every case: **the id in the discovery record is just a locator; possession of a private key is the
+identity.** A spoofed mDNS/SSDP record at worst causes a *failed* connect, never a compromise,
+because the impostor can't produce the key.
+
+### 4b. Beacon-carries-IP vs mDNS — comparison
+
+We already broadcast a UDP beacon on `:9291` (`beacon.rs`, per-interface, validated by the plugin's
+`BeaconListener` in `Reconnect.cs`). Extending its payload to carry IP+port+id is the *cheapest*
+self-discovery; mDNS is the *standard* one. Both were evaluated:
+
+| Dimension | **Extend the `:9291` beacon** | **mDNS / DNS-SD** *(chosen)* |
+|---|---|---|
+| Code to ship | Minimal — infra already exists both sides | Daemon-embedded responder crate + a plugin browser |
+| Device config | **None** — already egresses wlan0 today (getifaddrs) | None if daemon-embedded; (avoid the resolved drop-in path — wiped by OS updates) |
+| Carries id+port | Yes (after extension) | Yes (SRV+TXT) |
+| Reaches across net | Directed broadcast — dropped by AP isolation, no VLAN cross | Multicast — same limits, but more APs **reflect** mDNS (AirPlay/Chromecast plumbing) |
+| Interop / tooling | Custom — invisible to standard browsers | **Standard** — `dns-sd -B`, avahi, phones all see it; native Win10 `.local` |
+| Windows fragility | None (plugin listens itself) | `.local` can break under VPN split-DNS (mitigated: plugin does its own query) |
+| Device attack surface | **Send-only** on device (smaller) | Embedded responder parses hostile multicast (larger) |
+| Recon exposure | **Constant** ~1/s presence advert to whole L2 | Mostly query-driven (+ announce on change) |
+| Security (spoofing) | Spoofable → redirection risk | Spoofable/poisonable → identical redirection risk |
+
+**Decision (per project owner): mDNS is the primary mechanism** — standards interop (it shows up like
+any phone/printer, is debuggable with off-the-shelf tools, and benefits from AP mDNS reflection),
+with the beacon kept as the **reconnect-wake + LAN-robustness fallback** it already is. Both are
+gated on the identity handshake (§5); neither is trusted to pick the endpoint on its own.
+
+Resolution chain in `TcpSource` / `ConnectionConfig`:
 ```
-explicit override (env / inkbridge.json)  →  beacon-learned IP (paired id)  →
-  mDNS browse _inkbridge._tcp (paired id)  →  imx8mm-ferrari.local  →  USB 10.11.99.1  →  cached
+explicit override (env / inkbridge.json)  →  mDNS browse _inkbridge._tcp (filtered to paired id)
+  →  beacon-learned IP (paired id)  →  USB 10.11.99.1  →  cached last-IP
 ```
 **Re-resolve on every reconnect** — a cached IP is only a fast-path hint; never retry a dead IP as
 the primary path. mDNS/beacon are **link-local** — they do not cross subnets/VLANs or guest-Wi-Fi
@@ -180,24 +230,48 @@ validates the 4-byte `IBR1` magic — that's a **protocol version tag, not an id
 daemon on the subnet is interchangeable, and the hostname (`imx8mm-ferrari`) is **identical across
 same-model units**, so it can't disambiguate two rMPPs.
 
-**Mechanism — a pairing token + device id (one design solves identity *and* auth):**
+**Design (the one we're building) — a UUID *locator* + a pinned P-256 *key* identity.** This mirrors
+HomeKit/Matter/WireGuard (§4a): the id finds the device, the key proves it, USB is the out-of-band
+channel that bootstraps trust.
 
-1. **Bootstrap over USB (the trusted channel).** On first connect over the cable, the plugin and
-   daemon establish a shared **pairing secret** and a stable **device id** (e.g. a UUID the daemon
-   generates once and persists to `/home/root/inkbridge/identity`; or derived from the Wi-Fi MAC).
-   Store `{device_id: token}` on the PC in `inkbridge.json` next to the DLL, and the token on the
-   device. USB is the natural place because the user is already plugged in for first-time setup.
-2. **Advertise the id (not the secret).** The mDNS TXT record / extended beacon payload carries
-   `id=<device_id>` (plus `ver`, `port`). The plugin **filters discovery to its paired id**, so it
-   only ever connects to rMPP1 even if rMPP2 is on the same subnet.
-3. **Prove the secret on connect.** Each channel's handshake carries an HMAC/token line; the daemon
-   accepts only the matching token → rMPP1 only serves PC1 (or whichever PCs hold a valid token). A
-   rogue PC without the token is rejected at handshake.
+#### Why UUID, not MAC, for the locator
+- **MAC is the wrong identity.** Modern OSes do **MAC randomization** (so it isn't even stable); it's
+  **trivially spoofable** (anyone can claim it); it **leaks a hardware identifier** (privacy); and the
+  **Wi-Fi MAC ≠ USB MAC**, so it wouldn't be one value across transports. A MAC in a discovery record
+  is a fingerprint, not a credential.
+- **Use a random UUIDv4**, generated once on the device and persisted to
+  `/home/root/inkbridge/identity` (mode `0600`). It's stable, non-sensitive, hardware-agnostic, and
+  carried in the mDNS **TXT `id=`** purely as the *locator* so the plugin can filter discovery to its
+  paired device. The id is **public and spoofable** — it is **not** an authenticator (that's the
+  key). Filtering on it is convenience (pick the right device among several), not security.
 
-This is the **highest-leverage single change**: it answers the identity question *and* closes the
-authentication hole in §6. Interim (identity-only, weaker): pin a chosen `device_id` in
-`inkbridge.json` and filter discovery on it, deferring the cryptographic auth — but since we're
-adding the handshake anyway, doing the token at the same time is cheap.
+#### The crypto identity (what's actually trusted)
+- **Algorithm: NIST P-256 (ECDSA for auth; ECDH for future encryption).** Chosen because it's **what
+  Matter uses for device pairing**, it's **native in .NET 8** (`ECDsa` / `ECDiffieHellman`, no
+  third-party crypto in the plugin), and it's available as **pure-Rust** (`p256` crate, so the
+  musl-cross-compiled daemon needs no C/`ring` dependency). Each side generates a **long-term P-256
+  keypair on first run** (device key persisted next to the identity file; PC key in `inkbridge.json`).
+- **Pairing = trust-on-first-use over USB.** USB (`10.11.99.1`) is a *physically present,
+  point-to-point* channel — a better out-of-band bootstrap than HomeKit's printed code. On first
+  connect over the cable the two sides **exchange public keys** over the control plane and **pin**
+  them: the PC stores `{id → device_pubkey}` in `inkbridge.json`; the daemon adds the PC's pubkey to
+  an **allow-list** (`/home/root/inkbridge/authorized_keys`). (A future "pair this PC?" confirmation
+  on the device screen would harden TOFU against an attacker racing the first connect; the cable makes
+  that race impractical anyway.)
+- **Per-connection mutual authentication.** Every channel handshake (`:9292` pen, `:9294` touch,
+  `:9293` control) does a **mutual signed-nonce challenge-response**: each side sends a fresh random
+  nonce, the peer returns an **ECDSA signature** over (its-nonce ‖ peer-nonce ‖ channel-tag) with its
+  pinned key. The daemon **rejects an unrecognised/invalid signer immediately — before** acquiring the
+  wakelock or spawning work (closing the battery-drain + thread-storm DoS in §6). Result: **rMPP1
+  serves only PC1**, **PC1 connects only to rMPP1**, and a spoofed mDNS/beacon record at worst yields
+  a failed connect, never a capture.
+- **Encryption (follow-on, not v1):** the same P-256 keys do **ECDH → HKDF → AES-GCM** to encrypt the
+  pen/touch/control streams (handwriting/touch confidentiality, §6 #4). Auth lands first; encryption
+  reuses the established keys.
+
+This single mechanism answers the identity question (§5) *and* closes the authentication hole (§6).
+The UUID-only interim (filter on id, no key) is explicitly **not** treated as security — it's just
+the locator; the key is mandatory for the trust claim.
 
 ---
 
