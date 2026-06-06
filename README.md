@@ -213,7 +213,7 @@ Install it as in [Getting started](#getting-started) step 3.
 | [`otd-plugin/`](otd-plugin/) | C# / .NET 8 OpenTabletDriver 0.6.7 plugin — synthetic tablet device, packet decoder, report parser, touch passthrough (multitouch + gestures), PC-side telemetry, tablet config. |
 | [`appload/`](appload/) | On-device AppLoad app — QML frontend + Python backend; read-only active-area visualizer. |
 | [`protocol/`](protocol/) | `packet.md` — authoritative PenPacket wire spec; `touch-packet.md` — TouchPacket wire spec. |
-| [`tools/`](tools/) | Diagnostic scripts (pen probe, rate/tilt/button checks, HID diag) from bring-up. |
+| [`tools/`](tools/) | Diagnostic scripts (pen probe, rate / tilt / button checks) from bring-up. |
 | [`docs/`](docs/) | Verified device facts, architecture audit, and AppLoad design notes. |
 | [`PROJECT.md`](PROJECT.md) | Original design plan + audit brief, with an "as-built" status section. |
 

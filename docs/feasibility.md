@@ -1,5 +1,10 @@
 # inkbridge — Feasibility Audit
 
+> **Historical record.** This is the pre-implementation feasibility study, kept as-is. Some
+> details have since changed in the shipped code — notably the `INKBRIDGE_SYNTHETIC` host-only
+> test pen referenced below was removed once real-device testing took over. Treat the how-to
+> steps as a record of the original research, not current instructions.
+
 Audit performed before any implementation code, per `project.md` §9. Sources: live
 discovery on the rMPP (see `phase0-findings.md`) and a read of the current
 OpenTabletDriver `master` source on GitHub. Date: 2026-06-03.
