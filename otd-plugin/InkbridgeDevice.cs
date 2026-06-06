@@ -17,30 +17,42 @@ namespace Inkbridge
     }
 
     /// <summary>
-    /// Connects to the rMPP daemon over USB RNDIS and reads 18-byte frames after the
-    /// 4-byte "IBR1" hello. Reconnects on failure. Host/port via env vars.
+    /// Connects to the rMPP daemon and reads 18-byte frames after the 4-byte "IBR1" hello.
+    /// Reconnects on failure. The host is resolved per attempt through <see cref="ConnectionConfig"/>
+    /// (Auto/Wi-Fi/USB), so a mode change or live USB-takeover re-points the link without re-detecting
+    /// the OTD device tree: a registered abort closes the current socket and the next EnsureConnected
+    /// re-resolves. Port via INKBRIDGE_PORT (default 9292).
     /// </summary>
     internal sealed class TcpSource : IPacketSource
     {
-        private readonly string _host;
         private readonly int _port;
         private TcpClient? _client;
         private Stream? _stream;
         private bool _disposed;
         // Bounded backoff, then park on the device beacon instead of reconnecting forever.
         private readonly ReconnectPolicy _reconnect = new("pen");
+        // Lets ConnectionConfig drop our socket on a mode switch / USB-takeover (force reconnect).
+        private readonly IDisposable _abortReg;
 
-        public TcpSource(string host, int port) { _host = host; _port = port; }
+        public TcpSource(int port)
+        {
+            _port = port;
+            _abortReg = ConnectionConfig.Instance.RegisterAbort(AbortCurrent);
+        }
+
+        // Close the live socket so a blocking ReadExact aborts and EnsureConnected re-resolves.
+        private void AbortCurrent() { try { _client?.Close(); } catch { } }
 
         private void EnsureConnected()
         {
             while (!_disposed && _stream == null)
             {
+                string host = ConnectionConfig.Instance.ResolveHost();
                 try
                 {
                     _client = new TcpClient();
                     _client.NoDelay = true;
-                    _client.Connect(_host, _port);
+                    _client.Connect(host, _port);
                     var s = _client.GetStream();
                     var hello = new byte[4];
                     ReadExact(s, hello, 4);
@@ -49,11 +61,11 @@ namespace Inkbridge
                         throw new IOException("bad inkbridge hello");
                     _stream = s;
                     _reconnect.Reset();
-                    Log.Write("Inkbridge", $"Connected to daemon at {_host}:{_port}");
+                    Log.Write("Inkbridge", $"Connected to daemon at {host}:{_port}");
                 }
                 catch (Exception e)
                 {
-                    Log.Write("Inkbridge", $"Connect to {_host}:{_port} failed: {e.Message}", LogLevel.Warning);
+                    Log.Write("Inkbridge", $"Connect to {host}:{_port} failed: {e.Message}", LogLevel.Warning);
                     Cleanup();
                     _reconnect.Wait(() => _disposed);
                 }
@@ -99,7 +111,7 @@ namespace Inkbridge
             _stream = null; _client = null;
         }
 
-        public void Dispose() { _disposed = true; Cleanup(); }
+        public void Dispose() { _disposed = true; _abortReg.Dispose(); Cleanup(); }
     }
 
     /// <summary>OTD device endpoint stream wrapping a packet source.</summary>
@@ -135,10 +147,10 @@ namespace Inkbridge
 
         public IDeviceEndpointStream Open()
         {
-            string host = Environment.GetEnvironmentVariable("INKBRIDGE_HOST") ?? "10.11.99.1";
+            // Host is resolved per-connect by ConnectionConfig (Auto/Wi-Fi/USB); only the port is fixed here.
             int port = int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_PORT"), out var p) ? p : 9292;
-            Log.Write("Inkbridge", $"Opening TCP packet source -> {host}:{port}");
-            return new InkbridgeStream(new TcpSource(host, port));
+            Log.Write("Inkbridge", $"Opening TCP packet source (port {port}, mode-resolved host)");
+            return new InkbridgeStream(new TcpSource(port));
         }
 
         public string GetDeviceString(byte index) => string.Empty;

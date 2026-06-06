@@ -43,18 +43,22 @@ namespace Inkbridge
         private static long _packets;
         public static void NotePacket() => Interlocked.Increment(ref _packets);
 
+        // Current control socket, tracked so a Connection mode switch can drop it (force reconnect
+        // to the newly-resolved host).
+        private static TcpClient? _client;
+
         public static void Start()
         {
             lock (_gate)
             {
                 if (_started) return;
                 _started = true;
+                // On a Connection (Auto/Wi-Fi/USB) switch, close our socket so Run() reconnects to
+                // the new host. Registered once for the process lifetime.
+                ConnectionConfig.Instance.RegisterAbort(() => { try { _client?.Close(); } catch { } });
             }
             new Thread(Run) { IsBackground = true, Name = "InkbridgeTelemetry" }.Start();
         }
-
-        private static string Host =>
-            Environment.GetEnvironmentVariable("INKBRIDGE_HOST") ?? "10.11.99.1";
 
         private static string SettingsPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -75,11 +79,18 @@ namespace Inkbridge
 
         private static void Session()
         {
+            string host = ConnectionConfig.Instance.ResolveHost();
             using var client = new TcpClient { NoDelay = true };
-            client.Connect(Host, ControlPort);
+            _client = client; // let a mode switch close this to unblock our read
+            client.Connect(host, ControlPort);
             client.ReceiveTimeout = 2000;
             using var stream = client.GetStream();
             var utf8 = new UTF8Encoding(false);
+            // Line reader for the control plane (newline-delimited UTF-8). The daemon echoes each
+            // ping back as a pong on this same socket; reading whole *lines* (not raw chunks) is
+            // what lets us match a pong to its ping. Not disposed here on purpose — the underlying
+            // socket is owned by `using var stream` above.
+            var reader = new StreamReader(stream, utf8, false, 256, leaveOpen: true);
 
             void Send(string line)
             {
@@ -89,27 +100,44 @@ namespace Inkbridge
 
             Send("IBCP"); // publisher role
             _reconnect.Reset(); // connected — reset the backoff schedule
-            Log.Write("Inkbridge", $"telemetry connected to {Host}:{ControlPort}");
+            Log.Write("Inkbridge", $"telemetry connected to {host}:{ControlPort}");
 
             DateTime lastWrite = default;
             PushConfigIfChanged(Send, ref lastWrite); // initial push
 
             long lastPackets = Interlocked.Read(ref _packets);
             long lastStamp = Stopwatch.GetTimestamp();
-            var pong = new byte[256];
+            long pingSeq = 0;
 
             while (true)
             {
                 PushConfigIfChanged(Send, ref lastWrite);
 
-                // round-trip latency via ping/pong (the daemon echoes our ping back as pong).
-                // Stopwatch = monotonic, QueryPerformanceCounter-backed — correct for sub-ms intervals.
+                // Round-trip latency via ping/pong, MATCHED so the number is real on Wi-Fi too.
+                // The daemon echoes our ping verbatim with "ping"→"pong" (control.rs), so a unique
+                // monotonic `ts` lets us accept only *this* ping's pong and drain any stale line. The
+                // previous code read a raw chunk and timed "first bytes available" — over Wi-Fi a
+                // pong already buffered locally returned in ~0.1 ms (no round trip), so the display
+                // alternated between the true latency and a bogus ~0.1 ms. Stopwatch is monotonic
+                // (QueryPerformanceCounter-backed), correct for sub-ms intervals.
                 double latencyMs = -1;
+                long seq = ++pingSeq;
+                string expectedPong = "{\"type\":\"pong\",\"ts\":" + seq + "}";
                 long t0 = Stopwatch.GetTimestamp();
-                Send("{\"type\":\"ping\",\"ts\":0}");
-                int n = stream.Read(pong, 0, pong.Length); // throws on timeout -> reconnect
-                if (n > 0)
-                    latencyMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+                Send("{\"type\":\"ping\",\"ts\":" + seq + "}");
+                // Read lines until our pong arrives (throws on timeout -> reconnect). Bounded so a
+                // chatty/misbehaving peer can't spin us forever within the receive timeout.
+                for (int i = 0; i < 8; i++)
+                {
+                    string? line = reader.ReadLine();
+                    if (line == null) throw new EndOfStreamException(); // peer closed
+                    if (line.Trim() == expectedPong)
+                    {
+                        latencyMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+                        break;
+                    }
+                    // else: a stale pong from an earlier ping, or some other line — drain and retry.
+                }
 
                 // received-packet rate = true PC↔device line throughput as seen here
                 long nowPackets = Interlocked.Read(ref _packets);

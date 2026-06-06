@@ -22,6 +22,25 @@ namespace Inkbridge
     {
         [Resolved] public IDriver? Driver { set; get; }
 
+        // Connection dropdown values. Same string-validated pattern as the touch dropdown below
+        // (OTD 0.6.7 can't render a raw enum). Auto = USB cable if reachable, else Wi-Fi, switching
+        // live when the cable comes/goes; Wi-Fi / USB pin one transport. Mapped to ConnectionMode.
+        private const string ConnAuto = "Auto";
+        private const string ConnWiFi = "Wi-Fi";
+        private const string ConnUsb = "USB";
+
+        // Must be STATIC (OTD requires the PropertyValidated source to be static), like TouchModeChoices.
+        public static IEnumerable<string> ConnectionChoices => new[] { ConnAuto, ConnWiFi, ConnUsb };
+
+        /// <summary>
+        /// Which transport the plugin connects over (pen, touch, and telemetry all follow this). Auto
+        /// prefers the USB cable and falls back to Wi-Fi, taking the cable over again the moment it's
+        /// plugged in. Wi-Fi uses the discovered address / INKBRIDGE_HOST / imx8mm-ferrari.local; USB
+        /// uses the 10.11.99.1 cable. See docs/wifi-connectivity-feasibility.md §7.
+        /// </summary>
+        [Property("Connection"), PropertyValidated(nameof(ConnectionChoices)), DefaultPropertyValue(ConnAuto)]
+        public string ConnectionName { get; set; } = ConnAuto;
+
         // Touch-mode dropdown values. OTD 0.6.7's GeneratedControls cannot render a raw enum
         // property (throws NotSupportedException), so the choice is a *string* validated against
         // this member — that's how OTD builds a dropdown. Mapped to the TouchMode enum below.
@@ -130,6 +149,18 @@ namespace Inkbridge
                 Log.Write("Inkbridge", "IDriver was not injected — cannot register hub", LogLevel.Error);
                 return false;
             }
+
+            // Apply the connection mode first so every link (pen/touch/telemetry) resolves the right
+            // host. ConnectionConfig is a static singleton: no-ops when unchanged, and on a change it
+            // drops the live sockets so they reconnect to the new host (socket-only — it never calls
+            // Driver.Detect(), so the Detect()-orphan trap below doesn't apply).
+            ConnectionMode connMode = ConnectionName switch
+            {
+                ConnUsb => ConnectionMode.Usb,
+                ConnWiFi => ConnectionMode.WiFi,
+                _ => ConnectionMode.Auto,
+            };
+            ConnectionConfig.Instance.SetMode(connMode);
 
             // Start PC-side telemetry once: pushes connection/latency/rate + the active-area config
             // to the on-device visualizer (replaces the standalone companion app). Idempotent.

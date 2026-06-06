@@ -62,10 +62,21 @@ namespace Inkbridge
         // Bounded backoff, then park on the device beacon instead of reconnecting forever.
         private readonly ReconnectPolicy _reconnect = new("touch");
 
-        private TouchService() { }
+        private TouchService()
+        {
+            // On a Connection (Auto/Wi-Fi/USB) switch, drop the live touch socket so the worker
+            // reconnects to the newly-resolved host. Socket-only; the reconnect loop re-reads the
+            // host each iteration. Process-lifetime registration (this is a singleton).
+            ConnectionConfig.Instance.RegisterAbort(AbortCurrentClient);
+        }
 
-        private static string Host =>
-            Environment.GetEnvironmentVariable("INKBRIDGE_HOST") ?? "10.11.99.1";
+        private void AbortCurrentClient()
+        {
+            lock (_gate) { try { _client?.Close(); } catch { } }
+        }
+
+        // Host is resolved by the shared ConnectionConfig (Auto/Wi-Fi/USB), same as the pen link.
+        private static string Host => ConnectionConfig.Instance.ResolveHost();
 
         private static int TouchPort =>
             int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_TOUCH_PORT"), out var p) ? p : Port;
@@ -138,10 +149,11 @@ namespace Inkbridge
             while (!token.IsCancellationRequested)
             {
                 TcpClient? client = null;
+                string host = Host; // resolve once per attempt (Auto probes USB → don't repeat)
                 try
                 {
                     client = new TcpClient { NoDelay = true };
-                    client.Connect(Host, TouchPort);
+                    client.Connect(host, TouchPort);
                     lock (_gate)
                     {
                         if (token.IsCancellationRequested) { client.Dispose(); break; }
@@ -163,7 +175,7 @@ namespace Inkbridge
                     stream.WriteByte(optByte);
 
                     _reconnect.Reset(); // connected — reset the backoff schedule
-                    Log.Write("Inkbridge", $"Touch connected to {Host}:{TouchPort} ({mode})");
+                    Log.Write("Inkbridge", $"Touch connected to {host}:{TouchPort} ({mode})");
 
                     while (!token.IsCancellationRequested)
                     {
