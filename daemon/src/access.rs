@@ -12,7 +12,8 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 const WIFI_FLAG_FILE: &str = "/home/root/inkbridge/wifi-enabled";
 
@@ -32,6 +33,26 @@ pub fn wifi_enabled() -> bool {
         ));
         on
     })
+}
+
+/// A claimed connection slot; dropping it frees the slot. Held for the connection's lifetime (moved
+/// into the handler thread) so concurrency is capped without an explicit decrement at every exit.
+pub struct Slot(Arc<AtomicUsize>);
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Try to claim a connection slot under `max`. Returns None at capacity (caller drops the peer) —
+/// bounds threads/memory against a connection-storm DoS (T7). Each listener owns its own counter.
+pub fn claim(counter: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
+    if counter.fetch_add(1, Ordering::Relaxed) >= max {
+        counter.fetch_sub(1, Ordering::Relaxed);
+        None
+    } else {
+        Some(Slot(Arc::clone(counter)))
+    }
 }
 
 /// True if the peer is on the USB-RNDIS cable subnet (10.11.99.0/24) — the physically-present,

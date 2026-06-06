@@ -153,6 +153,8 @@ pub fn spawn(
             }
         };
         crate::log(&format!("touch plane listening on 0.0.0.0:{PORT}"));
+        let conns = Arc::new(AtomicUsize::new(0));
+        const MAX_TOUCH_CONNS: usize = 3;
         for incoming in listener.incoming() {
             let stream = match incoming {
                 Ok(s) => s,
@@ -166,6 +168,13 @@ pub fn spawn(
                 crate::log(&format!("touch: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
                 continue;
             }
+            let slot = match crate::access::claim(&conns, MAX_TOUCH_CONNS) {
+                Some(s) => s,
+                None => {
+                    crate::log(&format!("touch: at connection cap ({MAX_TOUCH_CONNS}); dropping {peer:?}"));
+                    continue;
+                }
+            };
             let trusted_usb = crate::access::is_usb_peer(peer);
             let refc = Arc::clone(&refc);
             let orient = Arc::clone(&orient);
@@ -173,6 +182,7 @@ pub fn spawn(
             let pen_in_range = Arc::clone(&pen_in_range);
             let id = Arc::clone(&id);
             thread::spawn(move || {
+                let _slot = slot; // frees the connection slot on handler exit
                 crate::log(&format!("touch client connected: {peer:?}"));
                 // Authenticates before the wakelock (see handle_client) — an unauthorized peer
                 // can't keep the device awake or read the touchscreen.

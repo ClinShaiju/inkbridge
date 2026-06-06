@@ -123,6 +123,11 @@ fn main() -> std::io::Result<()> {
     touch::spawn(Arc::clone(&refc), Arc::clone(&orient), app_subs, Arc::clone(&pen_in_range),
         Arc::clone(&id));
 
+    // Cap concurrent pen connections (OTD briefly opens a 2nd transient on settings-apply, so allow
+    // a little headroom) to bound a connection-storm DoS.
+    let pen_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    const MAX_PEN_CONNS: usize = 4;
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
@@ -131,12 +136,20 @@ fn main() -> std::io::Result<()> {
                     log(&format!("pen: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
                     continue; // drop before any work
                 }
+                let slot = match access::claim(&pen_conns, MAX_PEN_CONNS) {
+                    Some(s) => s,
+                    None => {
+                        log(&format!("pen: at connection cap ({MAX_PEN_CONNS}); dropping {peer:?}"));
+                        continue;
+                    }
+                };
                 let trusted_usb = access::is_usb_peer(peer);
                 let refc = Arc::clone(&refc);
                 let orient = Arc::clone(&orient);
                 let pen_in_range = Arc::clone(&pen_in_range);
                 let id = Arc::clone(&id);
                 thread::spawn(move || {
+                    let _slot = slot; // frees the connection slot when this handler exits
                     log(&format!("client connected: {peer:?}"));
                     // handle_client authenticates BEFORE taking the wakelock, so an unauthorized
                     // peer can't keep the device awake (battery-drain DoS) or read the digitizer.

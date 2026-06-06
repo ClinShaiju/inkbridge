@@ -67,6 +67,9 @@ pub fn spawn(id: Arc<Identity>) -> Arc<AtomicUsize> {
 fn run(hub: Arc<Mutex<Hub>>, app_subs: Arc<AtomicUsize>, id: Arc<Identity>) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT))?;
     crate::log(&format!("control plane listening on 0.0.0.0:{CONTROL_PORT}"));
+    // Cap concurrent control connections (publisher + local subscriber + replays/transients).
+    let conns = Arc::new(AtomicUsize::new(0));
+    const MAX_CONTROL_CONNS: usize = 6;
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -79,10 +82,18 @@ fn run(hub: Arc<Mutex<Hub>>, app_subs: Arc<AtomicUsize>, id: Arc<Identity>) -> s
             ));
             continue;
         }
+        let slot = match crate::access::claim(&conns, MAX_CONTROL_CONNS) {
+            Some(s) => s,
+            None => {
+                crate::log(&format!("control: at connection cap ({MAX_CONTROL_CONNS}); dropping"));
+                continue;
+            }
+        };
         let hub = Arc::clone(&hub);
         let app_subs = Arc::clone(&app_subs);
         let id = Arc::clone(&id);
         thread::spawn(move || {
+            let _slot = slot; // frees the connection slot on handler exit
             if let Err(e) = handle(stream, hub, app_subs, id) {
                 crate::log(&format!("control client ended: {e}"));
             }
