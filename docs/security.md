@@ -112,6 +112,22 @@ Wi-Fi.
 
 ---
 
+## 4a. Status (shipped)
+
+As of the wifi-hardening work, the following are **implemented + verified on-device** (ports
+`:9292` pen, `:9294` touch, `:9293` control, `:9291` beacon):
+- **Secure-by-default binding** — Wi-Fi exposure is opt-in (`/home/root/inkbridge/wifi-enabled`);
+  USB/loopback always served.
+- **Mutual P-256 identity handshake** on pen + touch + control(`IBCP`), rejecting unauthorized peers
+  *before* the wakelock; multiple PCs authorized over USB; clear rejection ack.
+- **AES-256-GCM encryption** (ECDH → HKDF) on pen + touch + control.
+- **`app_subs` gated** to the loopback on-device subscriber (`IBCS`).
+- **Connection caps** per port.
+- **Beacon HMAC** — forged `IBR1` broadcasts ignored once paired.
+
+Still open: USB-less pairing hardening (T2), multi-device discovery picker (T3), forward-secret
+(ephemeral) ECDH. See `pending-tasks.tmp.md`.
+
 ## 5. Recommendations (layered, by leverage)
 
 Ordered so each item is independently shippable; the first three are the "minimum viable for a Wi-Fi
