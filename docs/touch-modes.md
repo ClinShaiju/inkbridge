@@ -64,10 +64,20 @@ event3 (10-pt MT-B) ──daemon/src/touch.rs──▶ TCP :9294 (88-byte TouchP
 ## Coordinates & orientation
 
 Touch is the same physical surface as the pen at lower resolution (`2064 × 2832`, portrait native,
-0.729 aspect). Direct mode normalizes and rotates by the frame's orientation byte (the same one the
-pen carries, from `daemon/src/orientation.rs`) and maps onto the **primary monitor**, filling it
-(aspect stretched — fine for absolute touch). 90/270 orientation mapping should be confirmed
-on-device (same open item as the pen's 90/270 area rotation).
+0.729 aspect).
+
+In the default **Follow OTD area** configuration (both *Touch rotation* and *Touch monitor*), Direct
+mode reuses OTD's exact tablet-area → display affine transform (`TouchTarget.TryGetTransform`): the
+touch grid is converted to millimetres on the shared physical surface (`179 × 239 mm`), **cropped to
+the configured Tablet area** and rotated, then scaled to the Display area — i.e. touch is cropped and
+rotated *identically to the pen* and lands on the same screen + region. A finger outside the Tablet
+area clamps to the nearest display edge (as the pen does outside its area).
+
+Picking an explicit **Touch monitor** (Primary / Monitor 1–4) or an explicit **Touch rotation**
+instead stretches the **full** touch grid onto the chosen monitor, rotated by the frame's orientation
+byte / selected angle (no crop) — the documented "pin the whole surface to a monitor" behavior.
+90/270 orientation mapping in that path should be confirmed on-device (same open item as the pen's
+90/270 area rotation).
 
 ## Build & deploy
 

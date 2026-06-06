@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using OpenTabletDriver.Plugin;
 
@@ -11,8 +12,10 @@ namespace Inkbridge
     /// rotate for touch-aware apps — i.e. the rMPP behaves like an external touchscreen.
     ///
     /// OTD's own output pipeline can't do this (it is single-pointer); this consumer bypasses it and
-    /// calls user32 directly. Coordinates map the raw touch grid (2064×2832, portrait native) onto
-    /// the primary monitor, rotated by the frame's orientation byte.
+    /// calls user32 directly. In the default "Follow OTD area" configuration it reuses OTD's exact
+    /// tablet-area → display affine transform, so touch is cropped to the configured Tablet area and
+    /// rotated identically to the pen. Explicit monitor/rotation overrides instead stretch the whole
+    /// touch grid (2064×2832, portrait native) onto the chosen monitor, rotated by the selected angle.
     /// </summary>
     internal sealed class TouchInjector : ITouchConsumer
     {
@@ -44,28 +47,43 @@ namespace Inkbridge
             if (!EnsureInitialized())
                 return;
 
-            // Resolve the target rect (virtual-desktop pixels, same coordinate space as injection):
-            //  _monitor == -1 → OTD's configured Display area (matches the pen's screen)
-            //  else           → a specific monitor by selector (primary or 0-based index)
-            int tLeft, tTop, tW, tH;
-            bool haveRect = _monitor == -1
-                ? TouchTarget.TryGet(out tLeft, out tTop, out tW, out tH)
-                : MonitorList.TryGet(_monitor, out tLeft, out tTop, out tW, out tH);
-            if (!haveRect)
-            {
-                // Fall back to the primary monitor's bounds.
-                tLeft = 0; tTop = 0;
-                tW = GetSystemMetrics(SM_CXSCREEN);
-                tH = GetSystemMetrics(SM_CYSCREEN);
-            }
-            if (tW <= 0 || tH <= 0)
-                return;
+            // Default ("Follow OTD area" for both rotation and monitor): map through OTD's exact
+            // tablet-area → display transform, so touch is cropped to the configured Tablet area and
+            // rotated like the pen. Any explicit monitor/rotation override drops to the whole-surface
+            // path below (those choices are defined as mapping the full touch grid onto a monitor).
+            Matrix3x2 xform = default;
+            int oLeft = 0, oTop = 0, oW = 0, oH = 0;
+            bool useOtd = _monitor == -1 && _rotation == -2
+                && TouchTarget.TryGetTransform(out xform, out oLeft, out oTop, out oW, out oH)
+                && oW > 0 && oH > 0;
 
-            // Resolve rotation: OTD area rotation (-2), device orientation (-1), or fixed (0..3).
-            int rot = _rotation;
-            if (rot == -2 && !TouchTarget.TryGetRotation(out rot))
-                rot = -1; // OTD rotation unreadable → fall back to device orientation
-            byte orientation = (byte)(rot >= 0 ? rot : frame.Orientation);
+            // Whole-surface path: resolve the target rect and rotation up front.
+            int tLeft = 0, tTop = 0, tW = 0, tH = 0;
+            byte orientation = 0;
+            if (!useOtd)
+            {
+                // Resolve the target rect (virtual-desktop pixels, same coordinate space as injection):
+                //  _monitor == -1 → OTD's configured Display area (matches the pen's screen)
+                //  else           → a specific monitor by selector (primary or 0-based index)
+                bool haveRect = _monitor == -1
+                    ? TouchTarget.TryGet(out tLeft, out tTop, out tW, out tH)
+                    : MonitorList.TryGet(_monitor, out tLeft, out tTop, out tW, out tH);
+                if (!haveRect)
+                {
+                    // Fall back to the primary monitor's bounds.
+                    tLeft = 0; tTop = 0;
+                    tW = GetSystemMetrics(SM_CXSCREEN);
+                    tH = GetSystemMetrics(SM_CYSCREEN);
+                }
+                if (tW <= 0 || tH <= 0)
+                    return;
+
+                // Resolve rotation: OTD area rotation (-2), device orientation (-1), or fixed (0..3).
+                int rot = _rotation;
+                if (rot == -2 && !TouchTarget.TryGetRotation(out rot))
+                    rot = -1; // OTD rotation unreadable → fall back to device orientation
+                orientation = (byte)(rot >= 0 ? rot : frame.Orientation);
+            }
 
             int n = 0;
             bool anything = false;
@@ -77,7 +95,11 @@ namespace Inkbridge
                     continue; // empty slot, nothing to report
 
                 anything = true;
-                MapToScreen(c.X, c.Y, orientation, tLeft, tTop, tW, tH, out int px, out int py);
+                int px, py;
+                if (useOtd)
+                    MapVia(xform, c.X, c.Y, oLeft, oTop, oW, oH, out px, out py);
+                else
+                    MapToScreen(c.X, c.Y, orientation, tLeft, tTop, tW, tH, out px, out py);
 
                 uint flags;
                 if (down && !_wasDown[i])
@@ -243,6 +265,20 @@ namespace Inkbridge
 
             px = left + (int)Math.Round(u * (width - 1));
             py = top + (int)Math.Round(v * (height - 1));
+        }
+
+        /// <summary>
+        /// Map a raw touch-grid point through OTD's tablet-area → display transform (crop + rotation
+        /// baked in), then clamp to the display rect so a touch outside the configured Tablet area
+        /// sticks to the nearest edge instead of running off-screen — matching how the pen behaves
+        /// outside its area.
+        /// </summary>
+        private static void MapVia(in Matrix3x2 m, ushort x, ushort y,
+            int left, int top, int width, int height, out int px, out int py)
+        {
+            var p = Vector2.Transform(new Vector2(x, y), m);
+            px = Math.Clamp((int)Math.Round(p.X), left, left + width - 1);
+            py = Math.Clamp((int)Math.Round(p.Y), top, top + height - 1);
         }
 
         // ── Win32 pointer-injection interop ──
