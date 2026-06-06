@@ -10,7 +10,7 @@
 
 Turn a reMarkable Paper Pro (rMPP) into a full-featured graphics tablet input device for
 Windows — matching the capabilities of a real Wacom/Huion tablet (position, pressure, hover,
-pen buttons, optional tilt), with a proper management UI for active-area mapping and pressure
+optional tilt), with a proper management UI for active-area mapping and pressure
 curves.
 
 The approach: a lightweight **Rust daemon on the rMPP** reads the raw pen digitizer via evdev and
@@ -34,7 +34,7 @@ and `README.md`.)
   18-byte `PenPacket`s over TCP `:9292`, plus a control plane on `:9293`. Cross-compiled static
   musl (aarch64), installed as a systemd service.
 - `otd-plugin/` — OpenTabletDriver 0.6.7 plugin (C#/.NET 8): registers a synthetic network-sourced
-  tablet, decodes packets, feeds position/pressure/tilt/hover/buttons into OTD. Also hosts the
+  tablet, decodes packets, feeds position/pressure/tilt/hover into OTD. Also hosts the
   PC-side telemetry that publishes link status + active area to the device.
 - `appload/` — on-device AppLoad app (QML + Python backend): a **read-only** visualizer of the
   active-area box + connection/latency/rate stats.
@@ -57,6 +57,11 @@ and `README.md`.)
    *Windows Ink* output plugin and the X9VoiD *VMulti* driver. See `docs/feasibility.md` §2.
 5. **Verified device facts** replaced assumptions: pen reports at ~480–500 Hz, pressure is
    0..4096, and tilt + eraser + true hover distance are all exposed. See `docs/phase0-findings.md`.
+6. **No pen buttons.** The plan below lists pen-button mapping (§1 Goals, §3 Phase 3), but the
+   reMarkable Marker / Marker Plus has **no physical buttons** — the digitizer advertises
+   `BTN_STYLUS`/`BTN_STYLUS2` yet the stock pen never emits them. The wire format and plugin still
+   forward those bits for any third-party pen that has buttons, but inkbridge ships no pen-button
+   feature. See `docs/phase0-findings.md` and `protocol/packet.md`.
 
 ---
 

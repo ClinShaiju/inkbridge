@@ -4,7 +4,7 @@ import net.asivery.AppLoad 1.0
 // inkbridge on-device visualizer (read-only).
 //
 // OpenTabletDriver on the Windows host owns ALL configuration (active area, aspect lock,
-// rotation, pressure, buttons). This app only MIRRORS the live mapping so the user, looking at
+// rotation, pressure). This app only MIRRORS the live mapping so the user, looking at
 // the blank e-ink sheet, can see where on the physical surface the pen is active. The rMPP screen
 // IS the digitizer surface, so the box is drawn 1:1 (full-bleed) over the real region.
 //

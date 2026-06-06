@@ -55,7 +55,7 @@ if defined FOUND (
   setx OTD_DIR "!FOUND!" >nul
   set "OTD_DIR=!FOUND!"
   echo     OpenTabletDriver: !FOUND!
-  echo     saved OTD_DIR so start-inkbridge.cmd can find it
+  echo     saved OTD_DIR ^(helps re-runs locate OpenTabletDriver^)
 ) else (
   echo     [warn] OTD not located. Set it later with:
   echo            setx OTD_DIR "C:\path\to\OpenTabletDriver"
@@ -131,8 +131,7 @@ echo       - Enable the 'inkbridge' tool ^(Inkbridge.InkbridgeTool^) and APPLY S
 echo       - Output mode -^> Windows Ink Absolute Mode; bind the pen tip to the Windows Ink 'Pen Tip'.
 echo.
 echo     That's it - with the tool enabled, OpenTabletDriver connects to the daemon automatically
-echo     every time it runs. ^(start-inkbridge.cmd is optional: it loads the bundled cursor-mode
-echo     profile and restarts OTD.^)
+echo     every time it runs.
 echo.
 set /p "openvm=Open the VMulti download page now? (y/N): "
 if /i "!openvm!"=="y" start "" "https://github.com/X9VoiD/vmulti-bin/releases/latest"

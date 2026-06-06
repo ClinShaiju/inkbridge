@@ -22,7 +22,7 @@
 inkbridge streams the rMPP's pen digitizer over the USB cable into
 [OpenTabletDriver](https://opentabletdriver.net/) (OTD), so the tablet acts as a real graphics
 tablet on a Windows PC — position, **4096-level pressure**, hover, tilt, and eraser.
-You get OTD's area mapping, pressure-curve editor, and button bindings for free, and pressure
+You get OTD's area mapping and pressure-curve editor for free, and pressure
 reaches Windows Ink / WinTab apps like Krita, Clip Studio, and Photoshop.
 
 It also passes the rMPP's **10-finger touchscreen** through to Windows — as genuine multitouch
@@ -68,7 +68,7 @@ your device; use at your own risk.
   *alongside* a running `xochitl` (it never pauses it) and holds a kernel wakelock so the device
   doesn't sleep and power down the digitizer.
 - The **OTD plugin** registers a synthetic, network-sourced tablet inside OpenTabletDriver, decodes
-  the packets, and feeds position/pressure/tilt/hover/buttons into OTD's pipeline. It also publishes
+  the packets, and feeds position/pressure/tilt/hover into OTD's pipeline. It also publishes
   link status + the active area back to the tablet.
 - **Touch passthrough** (optional, off by default) streams the rMPP's 10-finger digitizer on a
   separate port (:9294) as an 88-byte `TouchPacket` per report. The plugin turns it into either
@@ -105,8 +105,8 @@ then run the installer — or do it by hand. To build the binaries yourself inst
    the installer detects OTD's folder from the running process (it's extract-and-run, so the path
    varies). It:
    - copies the OTD plugin + tablet config into `%LOCALAPPDATA%\OpenTabletDriver`,
-   - remembers your OpenTabletDriver folder (saved as the `OTD_DIR` env var for the optional
-     `start-inkbridge.cmd` helper),
+   - remembers your OpenTabletDriver folder (saved as the `OTD_DIR` env var so re-runs can
+     locate it),
    - then **asks whether to also install the daemon on the tablet over SSH** — answer **y** to do
      it (this is where the `.env` password is used). Prefer no prompt? Run `install.cmd /daemon` to
      install the daemon non-interactively.
@@ -124,11 +124,6 @@ then run the installer — or do it by hand. To build the binaries yourself inst
    to the daemon automatically; draw on the reMarkable and the cursor tracks the pen with pressure.
    The daemon auto-starts on the tablet, so as long as it's plugged in over USB, that's all there is
    to it — you don't need to run anything else each time.
-
-> **`start-inkbridge.cmd` is optional.** It restarts OpenTabletDriver and loads the bundled
-> cursor/mouse-mode profile (raw absolute cursor — handy for osu!-style use rather than pressure
-> drawing); `stop-inkbridge.cmd` closes OTD. For normal pressure drawing you don't need either —
-> just launch OpenTabletDriver.
 
 ### Manual install
 
@@ -157,8 +152,7 @@ Copy-Item Inkbridge.dll "$otd\Plugins\Inkbridge\"
 Copy-Item tablet-spec.json "$otd\Configurations\inkbridge.json"   # otd-plugin\tablet-spec.json in a repo checkout
 ```
 
-Then do steps 3–5 of the quick install above. If `start-inkbridge.cmd` can't find OpenTabletDriver,
-point it at the folder:  `setx OTD_DIR "C:\path\to\OpenTabletDriver"`.
+Then do steps 3–5 of the quick install above.
 
 **On-device visualizer (optional):** with XOVI + `rm-appload` installed on the tablet, run
 `python appload/deploy.py` (needs `pip install paramiko PySide6`) to deploy the read-only
@@ -213,7 +207,7 @@ Install it as in [Getting started](#getting-started) step 3.
 | [`otd-plugin/`](otd-plugin/) | C# / .NET 8 OpenTabletDriver 0.6.7 plugin — synthetic tablet device, packet decoder, report parser, touch passthrough (multitouch + gestures), PC-side telemetry, tablet config. |
 | [`appload/`](appload/) | On-device AppLoad app — QML frontend + Python backend; read-only active-area visualizer. |
 | [`protocol/`](protocol/) | `packet.md` — authoritative PenPacket wire spec; `touch-packet.md` — TouchPacket wire spec. |
-| [`tools/`](tools/) | Diagnostic scripts (pen probe, rate / tilt / button checks) from bring-up. |
+| [`tools/`](tools/) | Diagnostic scripts (pen probe, rate / tilt checks) from bring-up. |
 | [`docs/`](docs/) | Verified device facts, architecture audit, and AppLoad design notes. |
 | [`PROJECT.md`](PROJECT.md) | Original design plan + audit brief, with an "as-built" status section. |
 

@@ -28,8 +28,8 @@ It is already TCP/IP — the "USB cable" is just a **USB-Ethernet gadget**, not 
 - The plugin's `TcpSource` connects to a host from **`INKBRIDGE_HOST` env var, default
   `10.11.99.1`** (`otd-plugin/InkbridgeDevice.cs:179`). `10.11.99.1` is the **USB gadget IP**, so
   the default path is "over the cable" — but nothing about it is USB-specific.
-- The installer/launcher hardcode the same `10.11.99.1` for SSH deploy and the user-facing message
-  (`install.cmd:21`, `start-inkbridge.cmd:40`).
+- The installer hardcodes the same `10.11.99.1` for the SSH deploy and the user-facing message
+  (`install.cmd:21`).
 
 **Implication:** Wi-Fi is not a new transport to build. The link is interface-agnostic already.
 What's missing is (a) knowing the device's Wi-Fi IP and (b) telling the plugin to use it.
@@ -295,7 +295,7 @@ Everything new lives in **`daemon/`** (mDNS advertise + optional power-save togg
   `TCP_NODELAY`), `daemon/src/control.rs` (`:9293` ping/pong/status, role-token handshake),
   `otd-plugin/InkbridgeDevice.cs` (`TcpSource`, `INKBRIDGE_HOST` default `10.11.99.1`, hub/endpoint
   layer with no settings UI), `otd-plugin/InkbridgeTool.cs` (the `ITool` the user enables;
-  Detect()-orphan "apply twice" lifecycle), `install.cmd` / `start-inkbridge.cmd` (hardcoded
+  Detect()-orphan "apply twice" lifecycle), `install.cmd` (hardcoded
   `10.11.99.1`), `daemon/install-service.sh` (where a networkd drop-in would be written).
 - Cross-refs: `docs/phase0-findings.md` (device/power/watchdog model), `docs/feasibility.md`
   (overall plan), `docs/touch-feasibility.md` (contrast: touch *needs* a sidecar; Wi-Fi does not).

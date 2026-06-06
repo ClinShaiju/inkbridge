@@ -6,11 +6,8 @@ Full docs: https://github.com/ClinShaiju/inkbridge
 
 WHAT'S IN THIS ZIP
   install.cmd                 one-click Windows setup (just run it)
-  start-inkbridge.cmd         OPTIONAL: restart OTD + load the bundled cursor/mouse-mode profile
-  stop-inkbridge.cmd          OPTIONAL: close OpenTabletDriver
   Inkbridge.dll               the OpenTabletDriver plugin
   tablet-spec.json            OTD tablet descriptor
-  mouse-mode-settings.json    a ready-made OTD profile
   inkbridge-daemon            the tablet binary (runs on the reMarkable)
   inkbridge-daemon.service    systemd unit for the tablet
   install-service.sh          installs the daemon as a service on the tablet
@@ -37,8 +34,7 @@ QUICK START
      TWICE, set output mode to "Windows Ink Absolute Mode", and bind the pen tip to the
      Windows Ink "Pen Tip" handler.
   5. That's it - with the tool enabled, OpenTabletDriver connects to the daemon automatically
-     every time it runs. Just draw on the tablet. (start-inkbridge.cmd is optional - it loads the
-     bundled cursor/mouse-mode profile, e.g. for osu!-style raw cursor use.)
+     every time it runs. Just draw on the tablet.
 
 If OpenTabletDriver isn't found, point to it:  setx OTD_DIR "C:\path\to\OpenTabletDriver"
 

@@ -22,12 +22,9 @@ mkdir "%STAGE%\appload\backend"
 
 REM --- Windows-side scripts + config ---
 copy /y "%ROOT%install.cmd"                     "%STAGE%\" >nul
-copy /y "%ROOT%start-inkbridge.cmd"             "%STAGE%\" >nul
-copy /y "%ROOT%stop-inkbridge.cmd"              "%STAGE%\" >nul
 copy /y "%ROOT%.env.example"                    "%STAGE%\" >nul
 copy /y "%DLL%"                                 "%STAGE%\" >nul
 copy /y "%ROOT%otd-plugin\tablet-spec.json"     "%STAGE%\" >nul
-copy /y "%ROOT%otd-plugin\mouse-mode-settings.json" "%STAGE%\" >nul
 
 REM --- tablet-side daemon ---
 copy /y "%DAEMONBIN%"                           "%STAGE%\" >nul

@@ -65,7 +65,10 @@ Properties: (none)   # NOT marked INPUT_PROP_DIRECT/POINTER
   tool-agnostic (`packet.rs` captures `ABS_TILT_X/Y` regardless of active tool), so eraser
   tilt is forwarded end-to-end with no daemon change; only the OTD plugin needed wiring
   (`InkbridgeReport : IEraserReport` + mapping `BtnEraser` in the parser).
-- Both stylus buttons present (`BTN_STYLUS`, `BTN_STYLUS2`).
+- The digitizer **advertises** `BTN_STYLUS` / `BTN_STYLUS2` in its EV_KEY capabilities, but the
+  reMarkable Marker / Marker Plus has **no physical pen buttons**, so these codes are never
+  emitted in practice. inkbridge still forwards them (see `protocol/packet.md`) purely so a
+  third-party pen that does have buttons would work unchanged.
 - **Resolution fields are unreliable.** `res 2832` for X over a ~157 mm edge would imply
   ~3.9 mm of travel — physically wrong. Do **not** trust the evdev `resolution` field for
   mm mapping. Use raw `max` (11180 × 15340) plus the known physical active area for the OTD

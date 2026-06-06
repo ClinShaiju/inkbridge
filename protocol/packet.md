@@ -45,6 +45,11 @@ offset size field          notes
 | 4 | tool_rubber | `BTN_TOOL_RUBBER` — eraser end active |
 | 5–7 | reserved | 0 |
 
+> The `stylus1` / `stylus2` bits exist for protocol completeness and forwarding: the reMarkable
+> Marker and Marker Plus have **no physical pen buttons**, so the stock pen never sets them. They
+> are wired through end-to-end (the digitizer advertises `BTN_STYLUS`/`BTN_STYLUS2`) only so a
+> third-party pen that does report buttons would work without a format change.
+
 ### `flags` byte
 | bits | name | meaning |
 |-----:|------|---------|
