@@ -9,46 +9,12 @@ using OpenTabletDriver.Plugin.Devices;
 namespace Inkbridge
 {
     /// <summary>
-    /// Produces 18-byte PenPackets for the endpoint stream. Either a synthetic
-    /// generator (for the host-only pressure test) or a TCP client to the rMPP daemon.
+    /// Produces 18-byte PenPackets for the endpoint stream: a TCP client to the rMPP daemon.
     /// </summary>
     internal interface IPacketSource : IDisposable
     {
         /// <summary>Blocks until the next 18-byte packet is available.</summary>
         byte[] Next();
-    }
-
-    /// <summary>
-    /// Drives a Lissajous path across the surface with sinusoidal pressure so a
-    /// pressure-sensitive brush in Krita shows obvious line-weight variation —
-    /// no rMPP required. Enable with env var INKBRIDGE_SYNTHETIC=1.
-    /// </summary>
-    internal sealed class SyntheticSource : IPacketSource
-    {
-        private const int MaxX = 11180, MaxY = 15340, MaxP = 4096;
-        private readonly DateTime _start = DateTime.UtcNow;
-
-        public byte[] Next()
-        {
-            Thread.Sleep(10); // ~100 Hz
-            double t = (DateTime.UtcNow - _start).TotalSeconds;
-
-            // stay within the central 60% of the surface
-            ushort x = (ushort)(MaxX * (0.5 + 0.3 * Math.Sin(t * 1.7)));
-            ushort y = (ushort)(MaxY * (0.5 + 0.3 * Math.Sin(t * 2.3)));
-            // pressure oscillates 600..4096, always tip-down so it draws
-            ushort p = (ushort)(600 + (MaxP - 600) * 0.5 * (1 + Math.Sin(t * 4.0)));
-
-            byte buttons = (byte)(PenPacket.BtnTouch | PenPacket.BtnToolPen);
-            byte flags = 0x01 | 0x20; // version 1 + dist_valid
-
-            var pkt = new PenPacket((uint)(t * 1e6), x, y, p, 0, 0, 0, buttons, flags);
-            var buf = new byte[PenPacket.Size];
-            pkt.Write(buf);
-            return buf;
-        }
-
-        public void Dispose() { }
     }
 
     /// <summary>
@@ -167,21 +133,10 @@ namespace Inkbridge
 
         public IDeviceEndpointStream Open()
         {
-            bool synthetic = Environment.GetEnvironmentVariable("INKBRIDGE_SYNTHETIC") == "1";
-            IPacketSource source;
-            if (synthetic)
-            {
-                Log.Write("Inkbridge", "Opening SYNTHETIC packet source (INKBRIDGE_SYNTHETIC=1)");
-                source = new SyntheticSource();
-            }
-            else
-            {
-                string host = Environment.GetEnvironmentVariable("INKBRIDGE_HOST") ?? "10.11.99.1";
-                int port = int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_PORT"), out var p) ? p : 9292;
-                Log.Write("Inkbridge", $"Opening TCP packet source -> {host}:{port}");
-                source = new TcpSource(host, port);
-            }
-            return new InkbridgeStream(source);
+            string host = Environment.GetEnvironmentVariable("INKBRIDGE_HOST") ?? "10.11.99.1";
+            int port = int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_PORT"), out var p) ? p : 9292;
+            Log.Write("Inkbridge", $"Opening TCP packet source -> {host}:{port}");
+            return new InkbridgeStream(new TcpSource(host, port));
         }
 
         public string GetDeviceString(byte index) => string.Empty;

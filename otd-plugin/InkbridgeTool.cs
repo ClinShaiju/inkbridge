@@ -9,7 +9,7 @@ namespace Inkbridge
 {
     /// <summary>
     /// Resident plugin that registers the inkbridge device hub with OTD so our
-    /// network/synthetic pen source is enumerated like any USB tablet.
+    /// network pen source is enumerated like any USB tablet.
     ///
     /// OTD only exposes <see cref="IDriver"/> and IDriverDaemon to plugin
     /// (<c>[Resolved]</c>) injection — NOT ICompositeDeviceHub directly. The concrete
