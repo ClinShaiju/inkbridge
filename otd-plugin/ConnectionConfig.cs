@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading;
 using OpenTabletDriver.Plugin;
@@ -41,6 +43,8 @@ namespace Inkbridge
         private const int PenPort = 9292;
         private const int UsbProbeTimeoutMs = 300;
         private const int TakeoverPollMs = 3000;
+        /// <summary>How long a discovered Wi-Fi IP is reused before re-browsing (mDNS isn't free).</summary>
+        private const int WifiCacheMs = 20000;
 
         private readonly object _gate = new();
         private ConnectionMode _mode = ConnectionMode.Auto;
@@ -48,6 +52,10 @@ namespace Inkbridge
         private string _currentHost = UsbHost;
         private bool _supervisorStarted;
         private readonly List<Action> _aborts = new();
+        // Short-lived cache of the last discovered Wi-Fi IP, so per-reconnect ResolveHost calls don't
+        // each pay a ~1 s mDNS browse.
+        private string? _wifiCache;
+        private long _wifiCacheAt;
 
         private ConnectionConfig() { }
 
@@ -61,8 +69,109 @@ namespace Inkbridge
             Environment.GetEnvironmentVariable("INKBRIDGE_HOST"),
             Environment.GetEnvironmentVariable("INKBRIDGE_WIFI_HOST"));
 
-        // mDNS name; resolves once the responder is enabled on wlan0 (see wifi feasibility doc).
-        private static string WifiHost => Override ?? "imx8mm-ferrari.local";
+        /// <summary>
+        /// Resolve the Wi-Fi host: explicit override → fresh cached IP → mDNS discovery (filtered to
+        /// the paired device id) → last-good IP from inkbridge.json → the `.local` name as last resort.
+        /// </summary>
+        private string WifiHost()
+        {
+            var ov = Override;
+            if (ov != null) return ov; // power-user / explicit wins
+
+            lock (_gate)
+            {
+                if (_wifiCache != null && Environment.TickCount64 - _wifiCacheAt < WifiCacheMs)
+                    return _wifiCache;
+            }
+
+            string? ip = DiscoverWifiIp();
+            if (ip != null)
+            {
+                lock (_gate) { _wifiCache = ip; _wifiCacheAt = Environment.TickCount64; }
+                return ip;
+            }
+
+            var cfg = PluginConfig.Load();
+            if (!string.IsNullOrWhiteSpace(cfg.wifi_host)) return cfg.wifi_host!;
+            return "imx8mm-ferrari.local"; // mDNS responder name (works if the OS resolves .local)
+        }
+
+        /// <summary>
+        /// Browse mDNS for <c>_inkbridge._tcp</c>, pick the device matching our paired id (or adopt the
+        /// first one we see — trust-on-first-use — and persist it), and choose its Wi-Fi IPv4. Caches
+        /// the id + IP in inkbridge.json. Returns null if nothing usable was found.
+        /// </summary>
+        private static string? DiscoverWifiIp()
+        {
+            List<MdnsService> svcs;
+            try { svcs = MdnsClient.Discover(1200); } catch { return null; }
+            if (svcs.Count == 0) return null;
+
+            var cfg = PluginConfig.Load();
+            MdnsService? chosen = null;
+            if (!string.IsNullOrWhiteSpace(cfg.device_id))
+                chosen = svcs.Find(s => string.Equals(s.Id, cfg.device_id, StringComparison.OrdinalIgnoreCase));
+            if (chosen == null)
+            {
+                chosen = svcs[0]; // TOFU: adopt the first discovered device as the paired one
+                if (!string.Equals(cfg.device_id, chosen.Id, StringComparison.OrdinalIgnoreCase))
+                    Log.Write("Inkbridge", $"paired with device id {chosen.Id} (first discovered)");
+                cfg.device_id = chosen.Id;
+            }
+
+            string? ip = PickWifiAddress(chosen.Addresses);
+            if (ip == null) return null;
+            cfg.wifi_host = ip;
+            cfg.Save();
+            Log.Write("Inkbridge", $"mDNS discovered {chosen.Id} -> {ip}:{chosen.Port}");
+            return ip;
+        }
+
+        /// <summary>Choose the best IPv4 for the Wi-Fi link: skip link-local + the USB subnet; prefer
+        /// an address on the same subnet as a local interface.</summary>
+        private static string? PickWifiAddress(List<IPAddress> addrs)
+        {
+            IPAddress? fallback = null;
+            foreach (var a in addrs)
+            {
+                if (a.AddressFamily != AddressFamily.InterNetwork) continue;
+                byte[] b = a.GetAddressBytes();
+                if (b[0] == 169 && b[1] == 254) continue;                 // link-local
+                if (b[0] == 10 && b[1] == 11 && b[2] == 99) continue;     // USB gadget subnet, not Wi-Fi
+                if (OnLocalSubnet(a)) return a.ToString();                // directly reachable — best
+                fallback ??= a;
+            }
+            return fallback?.ToString();
+        }
+
+        private static bool OnLocalSubnet(IPAddress ip)
+        {
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        var mask = ua.IPv4Mask;
+                        if (mask == null) continue;
+                        if (SameSubnet(ip, ua.Address, mask)) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static bool SameSubnet(IPAddress a, IPAddress b, IPAddress mask)
+        {
+            byte[] ab = a.GetAddressBytes(), bb = b.GetAddressBytes(), mb = mask.GetAddressBytes();
+            if (ab.Length != bb.Length || ab.Length != mb.Length) return false;
+            for (int i = 0; i < ab.Length; i++)
+                if ((ab[i] & mb[i]) != (bb[i] & mb[i])) return false;
+            return true;
+        }
 
         /// <summary>Apply the selected mode. No-op if unchanged; otherwise force every live link to reconnect.</summary>
         public void SetMode(ConnectionMode mode)
@@ -86,8 +195,8 @@ namespace Inkbridge
             string host = mode switch
             {
                 ConnectionMode.Usb => UsbHost,
-                ConnectionMode.WiFi => WifiHost,
-                _ => UsbReachable() ? UsbHost : WifiHost, // Auto: USB first, fall back to Wi-Fi
+                ConnectionMode.WiFi => WifiHost(),
+                _ => UsbReachable() ? UsbHost : WifiHost(), // Auto: USB first, fall back to Wi-Fi
             };
             lock (_gate) _currentHost = host;
             return host;
