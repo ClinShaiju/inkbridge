@@ -20,6 +20,7 @@
 //!
 //! See docs/phase0-findings.md for device facts and protocol/packet.md for the wire format.
 
+mod access;
 mod auth;
 mod beacon;
 mod control;
@@ -125,6 +126,10 @@ fn main() -> std::io::Result<()> {
         match incoming {
             Ok(stream) => {
                 let peer = stream.peer_addr().ok();
+                if !access::peer_allowed(peer) {
+                    log(&format!("pen: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
+                    continue; // drop before any work
+                }
                 let refc = Arc::clone(&refc);
                 let orient = Arc::clone(&orient);
                 let pen_in_range = Arc::clone(&pen_in_range);

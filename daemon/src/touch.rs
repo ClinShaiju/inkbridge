@@ -162,6 +162,10 @@ pub fn spawn(
                 }
             };
             let peer = stream.peer_addr().ok();
+            if !crate::access::peer_allowed(peer) {
+                crate::log(&format!("touch: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
+                continue;
+            }
             let refc = Arc::clone(&refc);
             let orient = Arc::clone(&orient);
             let app_subs = Arc::clone(&app_subs);

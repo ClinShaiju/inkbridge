@@ -68,6 +68,13 @@ fn run(hub: Arc<Mutex<Hub>>, app_subs: Arc<AtomicUsize>) -> std::io::Result<()> 
             Ok(s) => s,
             Err(_) => continue,
         };
+        if !crate::access::peer_allowed(stream.peer_addr().ok()) {
+            crate::log(&format!(
+                "control: rejected {:?} — Wi-Fi exposure disabled (USB/loopback only)",
+                stream.peer_addr().ok()
+            ));
+            continue;
+        }
         let hub = Arc::clone(&hub);
         let app_subs = Arc::clone(&app_subs);
         thread::spawn(move || {
