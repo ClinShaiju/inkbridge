@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
-using System.Threading;
 using OpenTabletDriver.Plugin;
 using OpenTabletDriver.Plugin.Devices;
 
@@ -28,6 +27,8 @@ namespace Inkbridge
         private TcpClient? _client;
         private Stream? _stream;
         private bool _disposed;
+        // Bounded backoff, then park on the device beacon instead of reconnecting forever.
+        private readonly ReconnectPolicy _reconnect = new("pen");
 
         public TcpSource(string host, int port) { _host = host; _port = port; }
 
@@ -47,13 +48,14 @@ namespace Inkbridge
                         hello[2] != (byte)'R' || hello[3] != (byte)'1')
                         throw new IOException("bad inkbridge hello");
                     _stream = s;
+                    _reconnect.Reset();
                     Log.Write("Inkbridge", $"Connected to daemon at {_host}:{_port}");
                 }
                 catch (Exception e)
                 {
-                    Log.Write("Inkbridge", $"Connect to {_host}:{_port} failed: {e.Message}; retrying", LogLevel.Warning);
+                    Log.Write("Inkbridge", $"Connect to {_host}:{_port} failed: {e.Message}", LogLevel.Warning);
                     Cleanup();
-                    Thread.Sleep(1000);
+                    _reconnect.Wait(() => _disposed);
                 }
             }
         }

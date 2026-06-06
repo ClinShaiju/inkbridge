@@ -19,6 +19,20 @@ discovery (`docs/phase0-findings.md`). All multi-byte fields **little-endian**.
 > format) for the on-device visualizer — area config + link status. It is documented in
 > `daemon/src/control.rs` and `docs/appload-ui-spec.md`, and is independent of this pen stream.
 
+### Reconnect + presence beacon
+
+The plugin does **not** retry the pen port forever. On a failed/lost connection it reconnects
+with growing backoff (1→2→4→8→15→30 s, ~1 min total); once that budget is spent it stops
+hammering the network and parks until it hears the device.
+
+The daemon advertises itself with a **presence beacon**: a UDP datagram broadcast on `:9291`
+~once a second, payload the same 4 ASCII bytes `IBR1`. It is sent to every up, broadcast-capable
+IPv4 interface's broadcast address (not a single `255.255.255.255`), so the USB-RNDIS subnet is
+reached even when Wi-Fi is also up. The plugin's listener wakes on the first valid beacon and
+immediately reconnects. The same bounded-backoff-then-beacon policy governs the control plane
+(`:9293`) and touch (`:9294`) links. Beacon sender: `daemon/src/beacon.rs`; listener + policy:
+`otd-plugin/Reconnect.cs`. Env overrides: `INKBRIDGE_BEACON_PORT` (plugin listener).
+
 ## `PenPacket` — 18-byte layout
 
 ```

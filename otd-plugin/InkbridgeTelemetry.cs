@@ -36,6 +36,8 @@ namespace Inkbridge
 
         private static readonly object _gate = new();
         private static bool _started;
+        // Bounded backoff, then park on the device beacon instead of reconnecting forever.
+        private static readonly ReconnectPolicy _reconnect = new("telemetry");
 
         // Pen packets received since process start; fed by InkbridgeDevice's TcpSource.
         private static long _packets;
@@ -65,9 +67,9 @@ namespace Inkbridge
                 try { Session(); }
                 catch (Exception e)
                 {
-                    Log.Write("Inkbridge", $"telemetry link down: {e.Message}; retrying", LogLevel.Debug);
+                    Log.Write("Inkbridge", $"telemetry link down: {e.Message}", LogLevel.Debug);
                 }
-                Thread.Sleep(2000);
+                _reconnect.Wait(() => false);
             }
         }
 
@@ -86,6 +88,7 @@ namespace Inkbridge
             }
 
             Send("IBCP"); // publisher role
+            _reconnect.Reset(); // connected — reset the backoff schedule
             Log.Write("Inkbridge", $"telemetry connected to {Host}:{ControlPort}");
 
             DateTime lastWrite = default;

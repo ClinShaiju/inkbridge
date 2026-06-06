@@ -59,6 +59,8 @@ namespace Inkbridge
         // The worker's current connection, tracked so a mode switch can force-close it and
         // unblock the worker's blocking socket read (Thread.Interrupt does not abort a Read).
         private TcpClient? _client;
+        // Bounded backoff, then park on the device beacon instead of reconnecting forever.
+        private readonly ReconnectPolicy _reconnect = new("touch");
 
         private TouchService() { }
 
@@ -132,6 +134,7 @@ namespace Inkbridge
             }
 
             var buf = new byte[TouchPacket.Size];
+            _reconnect.Reset(); // fresh schedule for this worker
             while (!token.IsCancellationRequested)
             {
                 TcpClient? client = null;
@@ -159,6 +162,7 @@ namespace Inkbridge
                     if (!opts.PalmReject) optByte |= 0x02;
                     stream.WriteByte(optByte);
 
+                    _reconnect.Reset(); // connected — reset the backoff schedule
                     Log.Write("Inkbridge", $"Touch connected to {Host}:{TouchPort} ({mode})");
 
                     while (!token.IsCancellationRequested)
@@ -179,7 +183,8 @@ namespace Inkbridge
                     try { client?.Dispose(); } catch { }
                 }
 
-                if (!token.IsCancellationRequested) Sleep(1000);
+                if (!token.IsCancellationRequested)
+                    _reconnect.Wait(() => token.IsCancellationRequested);
             }
         }
 
@@ -192,11 +197,6 @@ namespace Inkbridge
                 if (n <= 0) throw new EndOfStreamException();
                 off += n;
             }
-        }
-
-        private static void Sleep(int ms)
-        {
-            try { Thread.Sleep(ms); } catch (ThreadInterruptedException) { }
         }
     }
 }

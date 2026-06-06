@@ -20,6 +20,7 @@
 //!
 //! See docs/phase0-findings.md for device facts and protocol/packet.md for the wire format.
 
+mod beacon;
 mod control;
 mod orientation;
 mod packet;
@@ -86,6 +87,10 @@ fn main() -> std::io::Result<()> {
     // plugin heartbeat goes stale. Own threads; never touches the pen stream below. Returns the
     // on-device-app subscriber count, used to gate touch passthrough to "AppLoad app is open".
     let app_subs = control::spawn();
+
+    // Broadcast a UDP presence beacon (:9291) so a plugin that gave up its bounded pen-port
+    // reconnect attempts wakes and reconnects the moment we're reachable again. Own thread.
+    beacon::spawn();
 
     // Detect screen orientation (accelerometer + xochitl lock) and publish it; the pen
     // stream below stamps it into every packet so OTD can rotate the area to match.

@@ -75,6 +75,9 @@ your device; use at your own risk.
   genuine Windows multitouch (`InjectTouchInput`) or PC-side gesture recognition (keystrokes /
   wheel). It's gated on the on-device app being open and on pen-priority palm rejection, so touch
   only reaches Windows when you want it. See [`docs/touch-modes.md`](docs/touch-modes.md).
+- **Reconnect** is bounded: if the link drops, the plugin retries with growing backoff for ~1 min,
+  then stops hammering the network and waits for the daemon's **presence beacon** — a 4-byte UDP
+  broadcast on `:9291` (~1 Hz) — to re-establish the moment the device is reachable again.
 - The optional **appload visualizer** draws the configured active-area box on the e-ink surface so
   you can see where the pen is "live", plus connection/latency/rate stats. It is read-only — OTD on
   the PC owns all configuration.
@@ -203,7 +206,7 @@ Install it as in [Getting started](#getting-started) step 3.
 
 | Path | What it is |
 |------|-----------|
-| [`daemon/`](daemon/) | Rust daemon for the rMPP — evdev pen + touch readers, TCP pen stream (:9292), control plane (:9293), touch stream (:9294), systemd unit, deploy script. |
+| [`daemon/`](daemon/) | Rust daemon for the rMPP — evdev pen + touch readers, TCP pen stream (:9292), control plane (:9293), touch stream (:9294), UDP presence beacon (:9291), systemd unit, deploy script. |
 | [`otd-plugin/`](otd-plugin/) | C# / .NET 8 OpenTabletDriver 0.6.7 plugin — synthetic tablet device, packet decoder, report parser, touch passthrough (multitouch + gestures), PC-side telemetry, tablet config. |
 | [`appload/`](appload/) | On-device AppLoad app — QML frontend + Python backend; read-only active-area visualizer. |
 | [`protocol/`](protocol/) | `packet.md` — authoritative PenPacket wire spec; `touch-packet.md` — TouchPacket wire spec. |
