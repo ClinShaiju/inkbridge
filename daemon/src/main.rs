@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
     // + link status pushed by the OTD plugin (PC side) and broadcasts "disconnected" when the
     // plugin heartbeat goes stale. Own threads; never touches the pen stream below. Returns the
     // on-device-app subscriber count, used to gate touch passthrough to "AppLoad app is open".
-    let app_subs = control::spawn();
+    let app_subs = control::spawn(Arc::clone(&id));
 
     // Broadcast a UDP presence beacon (:9291) so a plugin that gave up its bounded pen-port
     // reconnect attempts wakes and reconnects the moment we're reachable again. Own thread.
