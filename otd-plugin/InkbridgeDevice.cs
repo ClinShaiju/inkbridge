@@ -59,6 +59,9 @@ namespace Inkbridge
                     if (hello[0] != (byte)'I' || hello[1] != (byte)'B' ||
                         hello[2] != (byte)'R' || hello[3] != (byte)'1')
                         throw new IOException("bad inkbridge hello");
+                    // Mutual P-256 handshake before any pen data (authenticates the device + this PC).
+                    if (!AuthClient.Handshake(s, hello))
+                        throw new IOException("inkbridge authentication failed");
                     _stream = s;
                     _reconnect.Reset();
                     Log.Write("Inkbridge", $"Connected to daemon at {host}:{_port}");
