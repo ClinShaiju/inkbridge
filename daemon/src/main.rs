@@ -131,6 +131,7 @@ fn main() -> std::io::Result<()> {
                     log(&format!("pen: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
                     continue; // drop before any work
                 }
+                let trusted_usb = access::is_usb_peer(peer);
                 let refc = Arc::clone(&refc);
                 let orient = Arc::clone(&orient);
                 let pen_in_range = Arc::clone(&pen_in_range);
@@ -139,7 +140,7 @@ fn main() -> std::io::Result<()> {
                     log(&format!("client connected: {peer:?}"));
                     // handle_client authenticates BEFORE taking the wakelock, so an unauthorized
                     // peer can't keep the device awake (battery-drain DoS) or read the digitizer.
-                    if let Err(e) = handle_client(stream, &orient, &pen_in_range, &refc, &id) {
+                    if let Err(e) = handle_client(stream, &orient, &pen_in_range, &refc, &id, trusted_usb) {
                         log(&format!("session ended: {e}"));
                     }
                     log("client disconnected");
@@ -158,10 +159,11 @@ fn handle_client(
     pen_in_range: &AtomicBool,
     refc: &Arc<Mutex<WakeRefcount>>,
     id: &identity::Identity,
+    trusted_usb: bool,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?; // latency over throughput
     stream.write_all(b"IBR1")?; // protocol hello (version 1) — also the auth channel tag
-    let mut sess = match auth::server_handshake(&mut stream, b"IBR1", id)? {
+    let mut sess = match auth::server_handshake(&mut stream, b"IBR1", id, trusted_usb)? {
         Some(s) => s,
         None => return Ok(()), // unauthorized: no wakelock, no digitizer read
     };

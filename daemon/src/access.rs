@@ -34,6 +34,18 @@ pub fn wifi_enabled() -> bool {
     })
 }
 
+/// True if the peer is on the USB-RNDIS cable subnet (10.11.99.0/24) — the physically-present,
+/// point-to-point channel we treat as trusted for *pairing an additional PC* (T1).
+pub fn is_usb_peer(peer: Option<SocketAddr>) -> bool {
+    match peer {
+        Some(SocketAddr::V4(a)) => {
+            let o = a.ip().octets();
+            o[0] == 10 && o[1] == 11 && o[2] == 99
+        }
+        _ => false,
+    }
+}
+
 /// True if a freshly-accepted peer is allowed to be served. USB-subnet (10.11.99.0/24) and loopback
 /// are always allowed; anything else requires Wi-Fi exposure to be opted in. An unknown peer address
 /// is allowed only when Wi-Fi is enabled (fail-closed otherwise).

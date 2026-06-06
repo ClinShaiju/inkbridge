@@ -166,6 +166,7 @@ pub fn spawn(
                 crate::log(&format!("touch: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
                 continue;
             }
+            let trusted_usb = crate::access::is_usb_peer(peer);
             let refc = Arc::clone(&refc);
             let orient = Arc::clone(&orient);
             let app_subs = Arc::clone(&app_subs);
@@ -175,7 +176,7 @@ pub fn spawn(
                 crate::log(&format!("touch client connected: {peer:?}"));
                 // Authenticates before the wakelock (see handle_client) — an unauthorized peer
                 // can't keep the device awake or read the touchscreen.
-                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range, &refc, &id) {
+                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range, &refc, &id, trusted_usb) {
                     crate::log(&format!("touch session ended: {e}"));
                 }
                 crate::log("touch client disconnected");
@@ -191,10 +192,11 @@ fn handle_client(
     pen_in_range: &AtomicBool,
     refc: &Arc<Mutex<WakeRefcount>>,
     id: &crate::identity::Identity,
+    trusted_usb: bool,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.write_all(b"IBT1")?; // touch protocol hello (version 1) — also the auth channel tag
-    let mut sess = match crate::auth::server_handshake(&mut stream, b"IBT1", id)? {
+    let mut sess = match crate::auth::server_handshake(&mut stream, b"IBT1", id, trusted_usb)? {
         Some(s) => s,
         None => return Ok(()), // unauthorized: no wakelock, no touchscreen read
     };

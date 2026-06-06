@@ -175,6 +175,17 @@ namespace Inkbridge
             var sigPc = Identity.Sign(Msg(nonceDev, tag, RolePc));
             s.Write(sigPc, 0, sigPc.Length);
 
+            // 4b. read the device's verdict (plaintext ack): 1 = authorized, 0 = rejected.
+            var ack = new byte[1];
+            ReadExact(s, ack, 1);
+            if (ack[0] != 1)
+            {
+                Log.Write("Inkbridge",
+                    "auth: this PC is not authorized by the device — connect it once over USB to pair it",
+                    LogLevel.Error);
+                return null;
+            }
+
             // 5. derive the encrypted session (ECDH → HKDF; see CryptoSession). Plugin sends PC→dev,
             //    receives dev→PC.
             var shared = Identity.DeriveShared(devPub);

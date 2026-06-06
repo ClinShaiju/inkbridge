@@ -30,10 +30,14 @@ use crate::identity::{self, Identity};
 
 /// Authenticate a freshly-accepted client and, on success, return the established encrypted
 /// `Session`. On Ok(None) the caller must drop the connection without doing any work.
+/// `trusted_usb` = the peer arrived over the USB cable (10.11.99.0/24). The first PC is pinned
+/// trust-on-first-use; additional PCs are pinned only when they connect over USB (so a stranger on
+/// Wi-Fi can't add itself) — see docs T1.
 pub fn server_handshake<S: Read + Write>(
     stream: &mut S,
     tag: &[u8; 4],
     id: &Identity,
+    trusted_usb: bool,
 ) -> io::Result<Option<Session>> {
     // 1. Read the PC hello: pub_pc[65] ‖ nonce_pc[32].
     let mut hello = [0u8; 97];
@@ -75,16 +79,21 @@ pub fn server_handshake<S: Read + Write>(
         return Ok(None);
     }
 
-    // 4. Authorize: trust-on-first-use for the first PC, else require it to be pinned.
+    // 4. Authorize: already-pinned PCs always pass; the first PC is pinned trust-on-first-use; an
+    //    additional new PC is pinned only over USB (a stranger on Wi-Fi can't add itself).
     let authorized = if id.is_authorized(&pub_pc_hex) {
         true
-    } else if id.no_peers() {
-        id.authorize(&pub_pc_hex); // bootstrap (expected over USB)
+    } else if id.no_peers() || trusted_usb {
+        id.authorize(&pub_pc_hex); // bootstrap / add-another-PC over the cable
         true
     } else {
-        crate::log("auth: PC key not authorized (not the paired PC); rejecting");
+        crate::log("auth: PC key not authorized — connect this PC once over USB to pair it; rejecting");
         false
     };
+
+    // 4b. Tell the client the verdict (plaintext, before encryption starts) so a rejected PC gets a
+    //     clear signal instead of a silent reconnect loop. 1 = authorized, 0 = rejected.
+    stream.write_all(&[authorized as u8])?;
     if !authorized {
         return Ok(None);
     }
