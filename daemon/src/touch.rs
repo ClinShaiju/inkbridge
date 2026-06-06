@@ -1,11 +1,12 @@
 //! inkbridge touch passthrough — reads the rMPP finger digitizer (`/dev/input/event3`,
-//! "Elan touch input") and streams a fixed 88-byte `TouchPacket` per evdev `SYN_REPORT`
-//! over TCP `:9294`. The Windows side (OTD plugin's TouchService) decides what to do with
-//! it: nothing (Disabled — it never connects), genuine multitouch (`InjectTouchInput`), or
-//! gesture recognition. A connected client is necessary but not sufficient: touch frames flow
-//! only while the on-device AppLoad app is open (the control-plane subscriber count, `app_subs`)
-//! — so leaving the app stops touch — unless the client opts into "always on" via the options
-//! byte it sends after the hello.
+//! "Elan touch input") and streams a fixed 88-byte `TouchPacket` per evdev `SYN_REPORT`. In the v2
+//! muxed transport this runs as one reader thread of a single connection (`mux.rs`), writing each
+//! frame as channel `CH_TOUCH` through the connection's shared encrypted send half — there is no
+//! separate touch port any more. The Windows side (OTD plugin's TouchService) decides what to do with
+//! it: nothing (Disabled — it never subscribes), genuine multitouch (`InjectTouchInput`), or gesture
+//! recognition. Touch frames flow only while the on-device AppLoad app is open (the control-plane
+//! subscriber count, `app_subs`) — so leaving the app stops touch — unless the client opts into
+//! "always on" via the `sub touch` control message (`always_on`/`palm` fields, see mux.rs).
 //!
 //! Verified device facts (docs/touch-feasibility.md, probed 2026-06-04):
 //! - `event3` is a 10-slot **multitouch protocol B** device (`ABS_MT_SLOT` max 9,
@@ -17,20 +18,17 @@
 //!   app. xochitl reacting to touch is the same cosmetic cost as it inking under the pen. The
 //!   app-open gate (not a grab) is what keeps touch from leaking to Windows when you're not using
 //!   it.
-//! - Power: the rMPP autosleeps (`/sys/power/autosleep = mem`); we share main.rs's wakelock
-//!   refcount so the digitizer stays powered for the session.
+//! - Power: the rMPP autosleeps (`/sys/power/autosleep = mem`); the connection holds main.rs's
+//!   wakelock so the digitizer stays powered for the session.
 
-use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Instant;
 
-use crate::{client_in, client_out, WakeRefcount};
+use crate::crypto::SendHalf;
+use crate::mux::CH_TOUCH;
 
-const PORT: u16 = 9294;
 const TOUCH_NAME: &str = "Elan touch input";
 
 /// Fixed `TouchPacket` size. Must stay byte-for-byte identical to `protocol/touch-packet.md`
@@ -134,125 +132,40 @@ impl TouchState {
     }
 }
 
-/// Start the touch listener on its own thread. Shares the wakelock refcount with the pen
-/// path so either keeps the digitizer powered; reads the live orientation cell the pen
-/// stamps, so touch coordinates can be rotated PC-side to match the screen.
-pub fn spawn(
-    refc: Arc<Mutex<WakeRefcount>>,
+/// Live, per-connection touch options the muxed control channel updates on each `sub touch` message
+/// (see mux.rs). Shared with the reader thread so re-subscribing with changed fields takes effect
+/// without restarting the reader.
+#[derive(Default)]
+pub struct TouchOptions {
+    /// Stream touch even when the on-device AppLoad app is closed (no control subscriber).
+    pub always_on: AtomicBool,
+    /// Suppress touch while the pen is in range (pen-priority palm rejection). Default on.
+    pub palm_reject: AtomicBool,
+}
+
+/// Stream `TouchPacket`s over the shared send half until the connection dies or `stop` is set (touch
+/// unsubscribed / mode set to Disabled). Each frame is `[CH_TOUCH][88-byte frame]` written through
+/// `sender`; `wsock` is this thread's own clone of the connection socket. Frames are emitted only
+/// while gated on (AppLoad app open via `app_subs`, or `opts.always_on`) and the pen isn't in range
+/// (when `opts.palm_reject`). Reads `event3` un-grabbed.
+///
+/// Like the pen reader, this does not poll the socket for disconnect — `conn_alive` (set by the
+/// reader thread on EOF) and write failures end the loop.
+pub fn run_reader(
+    stop: Arc<AtomicBool>,
+    conn_alive: Arc<AtomicBool>,
+    sender: Arc<Mutex<SendHalf>>,
+    mut wsock: TcpStream,
     orient: Arc<AtomicU8>,
     app_subs: Arc<AtomicUsize>,
     pen_in_range: Arc<AtomicBool>,
-    id: Arc<crate::identity::Identity>,
+    opts: Arc<TouchOptions>,
 ) {
-    thread::spawn(move || {
-        let listener = match TcpListener::bind(("0.0.0.0", PORT)) {
-            Ok(l) => l,
-            Err(e) => {
-                crate::log(&format!("touch: bind :{PORT} failed: {e}"));
-                return;
-            }
-        };
-        crate::log(&format!("touch plane listening on 0.0.0.0:{PORT}"));
-        let conns = Arc::new(AtomicUsize::new(0));
-        const MAX_TOUCH_CONNS: usize = 3;
-        for incoming in listener.incoming() {
-            let stream = match incoming {
-                Ok(s) => s,
-                Err(e) => {
-                    crate::log(&format!("touch: accept error: {e}"));
-                    continue;
-                }
-            };
-            let peer = stream.peer_addr().ok();
-            if !crate::access::peer_allowed(peer) {
-                crate::log(&format!("touch: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
-                continue;
-            }
-            let slot = match crate::access::claim(&conns, MAX_TOUCH_CONNS) {
-                Some(s) => s,
-                None => {
-                    crate::log(&format!("touch: at connection cap ({MAX_TOUCH_CONNS}); dropping {peer:?}"));
-                    continue;
-                }
-            };
-            let trusted_usb = crate::access::is_usb_peer(peer);
-            let refc = Arc::clone(&refc);
-            let orient = Arc::clone(&orient);
-            let app_subs = Arc::clone(&app_subs);
-            let pen_in_range = Arc::clone(&pen_in_range);
-            let id = Arc::clone(&id);
-            thread::spawn(move || {
-                let _slot = slot; // frees the connection slot on handler exit
-                crate::log(&format!("touch client connected: {peer:?}"));
-                // Authenticates before the wakelock (see handle_client) — an unauthorized peer
-                // can't keep the device awake or read the touchscreen.
-                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range, &refc, &id, trusted_usb) {
-                    crate::log(&format!("touch session ended: {e}"));
-                }
-                crate::log("touch client disconnected");
-            });
-        }
-    });
-}
-
-fn handle_client(
-    mut stream: TcpStream,
-    orient: &AtomicU8,
-    app_subs: &AtomicUsize,
-    pen_in_range: &AtomicBool,
-    refc: &Arc<Mutex<WakeRefcount>>,
-    id: &crate::identity::Identity,
-    trusted_usb: bool,
-) -> std::io::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.write_all(b"IBT1")?; // touch protocol hello (version 1) — also the auth channel tag
-    let mut sess = match crate::auth::server_handshake(&mut stream, b"IBT1", id, trusted_usb)? {
-        Some(s) => s,
-        None => return Ok(()), // unauthorized: no wakelock, no touchscreen read
-    };
-
-    // Authorized: hold the device awake for the touch session.
-    client_in(refc);
-    let r = serve(&mut stream, orient, app_subs, pen_in_range, &mut sess);
-    client_out(refc);
-    r
-}
-
-/// Read the client options byte, then stream touch until the socket breaks.
-fn serve(
-    stream: &mut TcpStream,
-    orient: &AtomicU8,
-    app_subs: &AtomicUsize,
-    pen_in_range: &AtomicBool,
-    sess: &mut crate::crypto::Session,
-) -> std::io::Result<()> {
-    // Client sends one encrypted options byte: bit0 = "always on" (stream even when the AppLoad
-    // app is closed); bit1 = "no palm rejection" (don't suppress touch while the pen is in range).
-    let opt = sess.read_record(stream)?;
-    let opt0 = opt.first().copied().unwrap_or(0);
-    let always_on = opt0 & 0x01 != 0;
-    let palm_reject = opt0 & 0x02 == 0; // bit set = DISABLE palm rejection
-    crate::log(&format!("touch: client options always_on={always_on} palm_reject={palm_reject}"));
-
-    stream_touch(stream, orient, app_subs, always_on, palm_reject, pen_in_range, sess)
-}
-
-/// Open `event3` (un-grabbed) and stream `TouchPacket`s until the socket breaks. Frames are
-/// emitted only while gated on (AppLoad app open, or `always_on`); leaving the app stops touch.
-fn stream_touch(
-    stream: &mut TcpStream,
-    orient: &AtomicU8,
-    app_subs: &AtomicUsize,
-    always_on: bool,
-    palm_reject: bool,
-    pen_in_range: &AtomicBool,
-    sess: &mut crate::crypto::Session,
-) -> std::io::Result<()> {
     let mut dev = match find_touch() {
         Some(d) => d,
         None => {
             crate::log("ERROR: touch device 'Elan touch input' not found");
-            return Ok(());
+            return;
         }
     };
 
@@ -261,31 +174,30 @@ fn stream_touch(
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
-    let sock_fd = stream.as_raw_fd();
 
-    let start = Instant::now();
+    crate::log("touch: reader started");
+    let start = std::time::Instant::now();
     let mut state = TouchState::default();
     let mut buf = [0u8; SIZE];
+    let mut framed = [0u8; 1 + SIZE];
+    framed[0] = CH_TOUCH;
     let mut had_active = false; // did the last emitted frame carry contacts?
     let mut was_gated = false; // was passthrough enabled on the previous report?
 
     loop {
-        let mut pfds = [
-            libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: sock_fd, events: libc::POLLIN, revents: 0 },
-        ];
-        let pr = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 100) };
+        if stop.load(Ordering::Relaxed) || !conn_alive.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut pfds = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }];
+        let pr = unsafe { libc::poll(pfds.as_mut_ptr(), 1, 100) };
         if pr < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(e);
-        }
-
-        // Client closed (EOF/hangup/error on the socket).
-        if pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            return Ok(());
+            crate::log(&format!("touch: poll error: {e}"));
+            break;
         }
 
         if pfds[0].revents & libc::POLLIN != 0 {
@@ -298,9 +210,11 @@ fn stream_touch(
                             EventType::SYNCHRONIZATION => {
                                 if ev.code() == 0 {
                                     // Gate: forward touch only while the AppLoad app is open
-                                    // (≥1 control subscriber), unless the client opted "always on";
-                                    // and suppress touch entirely while the pen is in range (palm
-                                    // rejection) so a resting palm doesn't register while drawing.
+                                    // (≥1 control subscriber), unless "always on"; and suppress
+                                    // touch entirely while the pen is in range (palm rejection) so a
+                                    // resting palm doesn't register while drawing.
+                                    let always_on = opts.always_on.load(Ordering::Relaxed);
+                                    let palm_reject = opts.palm_reject.load(Ordering::Relaxed);
                                     let app_ok = always_on || app_subs.load(Ordering::Relaxed) > 0;
                                     let pen_blocks = palm_reject && pen_in_range.load(Ordering::Relaxed);
                                     let gated = app_ok && !pen_blocks;
@@ -312,7 +226,10 @@ fn stream_touch(
                                         // frame on the transition to no-fingers (PC issues UPs).
                                         if active || had_active {
                                             state.serialize(ts, orientation, &mut buf);
-                                            sess.write_record(stream, &buf)?;
+                                            framed[1..].copy_from_slice(&buf);
+                                            if send(&sender, &mut wsock, &framed, &conn_alive).is_err() {
+                                                return;
+                                            }
                                         }
                                         had_active = active;
                                     } else if was_gated || had_active {
@@ -320,7 +237,10 @@ fn stream_touch(
                                         // one empty frame so the PC releases everything, then stay
                                         // quiet so the rMPP's own touch is unaffected.
                                         empty_frame(ts, orientation, &mut buf);
-                                        sess.write_record(stream, &buf)?;
+                                        framed[1..].copy_from_slice(&buf);
+                                        if send(&sender, &mut wsock, &framed, &conn_alive).is_err() {
+                                            return;
+                                        }
                                         had_active = false;
                                     }
                                     was_gated = gated;
@@ -331,10 +251,28 @@ fn stream_touch(
                     }
                 }
                 Err(ref e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    crate::log(&format!("touch: device read error: {e}"));
+                    break;
+                }
             }
         }
     }
+    crate::log("touch: reader stopped");
+}
+
+/// Encrypt+write one framed record under the shared mutex; flag the connection dead on failure.
+fn send(
+    sender: &Arc<Mutex<SendHalf>>,
+    wsock: &mut TcpStream,
+    framed: &[u8],
+    conn_alive: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let r = sender.lock().unwrap().write_record(wsock, framed);
+    if r.is_err() {
+        conn_alive.store(false, Ordering::Relaxed);
+    }
+    r
 }
 
 /// Write an all-empty (no contacts) frame: header only, every slot inactive. Used to release

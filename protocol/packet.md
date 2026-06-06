@@ -3,21 +3,24 @@
 Authoritative binary layout for rMPP daemon → Windows OTD plugin. Derived from real device
 discovery (`docs/phase0-findings.md`). All multi-byte fields **little-endian**.
 
-## Transport
+> **v2 transport (shipped):** the 18-byte `PenPacket` payload below is unchanged, but it is no
+> longer carried on its own TCP port. In v2 pen, touch, and control share **one muxed connection on
+> `:9292`**: the pen stream is **channel 1**, each packet sent as the plaintext of an AES-GCM record
+> `[u32 len][ct‖tag]` with plaintext `[channel(1)=1][18-byte PenPacket]`. The connection hello is
+> `IBMX` (not `IBR1`) and the pen reader starts on a `sub pen` control message. See
+> `protocol/mux-v2.md` for the full muxed framing. The section below describes the **payload** and the
+> sampling/keepalive semantics, which are identical in v2.
 
-- Raw TCP over USB RNDIS. The daemon listens on `0.0.0.0:9292` (reach it at `10.11.99.1:9292`
-  over the USB tether).
+## Transport (payload + semantics — see mux-v2.md for the v2 framing)
+
 - `TCP_NODELAY` set; no Nagle batching (latency over throughput).
 - One `PenPacket` per evdev `SYN_REPORT` (coalesce all axis updates since the last SYN into
   one packet — do not emit a packet per axis event). While the pen is in range the daemon also
   resends the current state at ~60 Hz as a keepalive; it goes quiet once the pen leaves range.
-- No length prefix: packets are fixed size (**18 bytes**). The receiver reads in 18-byte frames.
-- A 4-byte ASCII hello `IBR1` is sent once by the daemon on connect, before the first packet,
-  so the client can validate the stream and protocol version (`1`).
-
-> A separate **control plane** runs on TCP `:9293` (newline-delimited JSON, not this binary
-> format) for the on-device visualizer — area config + link status. It is documented in
-> `daemon/src/control.rs` and `docs/appload-ui-spec.md`, and is independent of this pen stream.
+- Fixed size **18 bytes** per packet.
+- **v1 (historical):** raw TCP on `:9292`, packets sent unframed (no length prefix) after a one-time
+  4-byte `IBR1` hello, with a separate control plane on `:9293`. v2 replaces this — see the banner
+  above and `protocol/mux-v2.md`.
 
 ### Reconnect + presence beacon
 

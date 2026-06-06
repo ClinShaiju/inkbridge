@@ -53,11 +53,11 @@ namespace Inkbridge
         public static IEnumerable<string> TouchModeChoices => new[] { ModeDisabled, ModeDirect, ModeGesture };
 
         /// <summary>
-        /// Touch passthrough mode (dropdown). Disabled = the plugin never connects to the daemon's
-        /// touch port (:9294), so the rMPP touchscreen keeps driving its own UI. Direct touch =
-        /// genuine Windows multitouch (pinch-zoom). Gesture = multi-finger gestures → keystrokes.
-        /// See docs/touch-modes.md. The daemon grabs the touchscreen only while a client is
-        /// connected, so switching away from Disabled is what actually routes fingers to Windows.
+        /// Touch passthrough mode (dropdown). Disabled = the plugin never subscribes to the daemon's
+        /// touch channel, so the rMPP touchscreen keeps driving its own UI. Direct touch = genuine
+        /// Windows multitouch (pinch-zoom). Gesture = multi-finger gestures → keystrokes. See
+        /// docs/touch-modes.md. The daemon reads event3 only while touch is subscribed, so switching
+        /// away from Disabled is what actually routes fingers to Windows.
         /// </summary>
         [Property("Touch mode"), PropertyValidated(nameof(TouchModeChoices)), DefaultPropertyValue(ModeDisabled)]
         public string TouchModeName { get; set; } = ModeDisabled;

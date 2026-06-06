@@ -2,8 +2,6 @@ using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
-using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
 using OpenTabletDriver.Plugin;
@@ -11,41 +9,46 @@ using OpenTabletDriver.Plugin;
 namespace Inkbridge
 {
     /// <summary>
-    /// PC-side telemetry for the on-device inkbridge visualizer. Runs for the OTD daemon's
-    /// lifetime in its own background thread (started once from <see cref="InkbridgeTool"/>).
+    /// PC-side telemetry for the on-device inkbridge visualizer. Runs for the OTD daemon's lifetime in
+    /// its own background thread (started once from <see cref="InkbridgeTool"/>).
     ///
-    /// Connects to the rMPP daemon control plane (TCP &lt;host&gt;:9293) as a publisher and:
-    ///   • pushes the active-area <c>config</c> read from OTD's settings.json (re-pushing whenever the
-    ///     file changes, i.e. when you Save in the OTD GUI);
+    /// In v2 it no longer owns a socket: it rides the shared <see cref="ConnectionManager"/>'s control
+    /// channel (channel 0 of the one muxed connection). It:
+    ///   • pushes the active-area <c>config</c> read from OTD's settings.json (re-pushing when the file
+    ///     changes, and on every reconnect);
     ///   • every ~1 s measures round-trip latency (ping/pong, timed with a monotonic high-resolution
-    ///     <see cref="Stopwatch"/>) and pushes <c>status</c> {connected, latency_ms, rate_hz}.
+    ///     <see cref="Stopwatch"/>) and pushes <c>status</c> {connected, latency_ms, rate_hz};
+    ///   • stores the device beacon key the daemon hands over on the control channel.
     ///
-    /// latency_ms is the network round-trip of the control socket over USB — NOT end-to-end pen
-    /// input lag (which is dominated by the ~480 Hz digitizer sampling, ~2 ms/sample). rate_hz is
-    /// the pen-packet rate this plugin actually receives (fed by <see cref="NotePacket"/>) = the true
-    /// PC↔device line rate; on this device the digitizer runs ~480–500 Hz (measured), well above a
-    /// typical Wacom (~133–200 Hz).
+    /// latency_ms is the network round-trip of the control channel — NOT end-to-end pen input lag.
+    /// rate_hz is the pen-packet rate the manager actually receives (fed by <see cref="NotePacket"/>),
+    /// i.e. the true PC↔device line rate.
     ///
-    /// Because this lives in the always-running OTD plugin there is no separate companion app: if OTD
-    /// is up and the device reachable the heartbeat flows; if the USB is pulled or OTD closes the
-    /// heartbeat stops and the daemon flips the on-device UI to "Disconnected" within ~3 s.
+    /// When the link is down the manager's SendControl is a no-op, so no status flows; the daemon then
+    /// flips the on-device UI to "Disconnected" within ~3 s on its own (control.rs staleness).
     /// </summary>
     internal static class InkbridgeTelemetry
     {
-        private const int ControlPort = 9293;
-
         private static readonly object _gate = new();
         private static bool _started;
-        // Bounded backoff, then park on the device beacon instead of reconnecting forever.
-        private static readonly ReconnectPolicy _reconnect = new("telemetry");
 
-        // Pen packets received since process start; fed by InkbridgeDevice's TcpSource.
+        // Pen packets received since process start; fed by ConnectionManager's read loop.
         private static long _packets;
         public static void NotePacket() => Interlocked.Increment(ref _packets);
 
-        // Current control socket, tracked so a Connection mode switch can drop it (force reconnect
-        // to the newly-resolved host).
-        private static TcpClient? _client;
+        // Latency measurement state, guarded by _statGate. The daemon echoes our ping verbatim with
+        // "ping"→"pong", so we match the exact expected pong string for *this* ping (unique ts).
+        private static readonly object _statGate = new();
+        private static long _pingSeq;
+        private static string _expectedPong = "";
+        private static long _pingT0;
+        private static double _latencyMs = -1;
+        private static readonly ManualResetEventSlim _pong = new(false);
+
+        // rate baseline + config push gate.
+        private static long _lastPackets;
+        private static long _lastStamp;
+        private static DateTime _lastConfigWrite;
 
         public static void Start()
         {
@@ -53,10 +56,11 @@ namespace Inkbridge
             {
                 if (_started) return;
                 _started = true;
-                // On a Connection (Auto/Wi-Fi/USB) switch, close our socket so Run() reconnects to
-                // the new host. Registered once for the process lifetime.
-                ConnectionConfig.Instance.RegisterAbort(() => { try { _client?.Close(); } catch { } });
             }
+            var mgr = ConnectionManager.Instance;
+            mgr.ControlLine += OnControlLine;
+            mgr.Connected += OnConnected;
+            mgr.Start();
             new Thread(Run) { IsBackground = true, Name = "InkbridgeTelemetry" }.Start();
         }
 
@@ -64,103 +68,75 @@ namespace Inkbridge
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "OpenTabletDriver", "settings.json");
 
-        private static void Run()
+        /// <summary>On (re)connect: force a config re-push and reset the latency + rate baselines.</summary>
+        private static void OnConnected()
         {
-            while (true)
+            lock (_statGate)
             {
-                try { Session(); }
-                catch (Exception e)
+                _lastConfigWrite = default;
+                _latencyMs = -1;
+            }
+            _lastPackets = Interlocked.Read(ref _packets);
+            _lastStamp = Stopwatch.GetTimestamp();
+            Log.Write("Inkbridge", "telemetry: connected (authenticated, encrypted)");
+        }
+
+        /// <summary>Handle inbound control lines: our pong (latency) and the device beacon key.</summary>
+        private static void OnControlLine(string line)
+        {
+            string t = line.Trim();
+            if (t.Length == 0) return;
+            if (t.Contains("\"pong\""))
+            {
+                lock (_statGate)
                 {
-                    Log.Write("Inkbridge", $"telemetry link down: {e.Message}", LogLevel.Debug);
+                    if (t == _expectedPong)
+                        _latencyMs = (Stopwatch.GetTimestamp() - _pingT0) * 1000.0 / Stopwatch.Frequency;
                 }
-                _reconnect.Wait(() => false);
+                _pong.Set();
+            }
+            else if (t.Contains("\"beaconkey\""))
+            {
+                StoreBeaconKeyIfPresent(t);
             }
         }
 
-        private static void Session()
+        private static void Run()
         {
-            string host = ConnectionConfig.Instance.ResolveHost();
-            using var client = new TcpClient { NoDelay = true };
-            _client = client; // let a mode switch close this to unblock our read
-            client.Connect(host, ControlPort);
-            client.ReceiveTimeout = 2000;
-            using var stream = client.GetStream();
-            var utf8 = new UTF8Encoding(false);
-
-            // Send the publisher role line (plaintext), then run the P-256 handshake; everything
-            // after is AES-GCM records on the returned session (mirrors control.rs). Closes the
-            // config/status-injection + area/latency-eavesdrop holes on the control plane. The daemon
-            // echoes each ping back as a pong record, so a unique ts still matches request↔reply.
-            var roleBytes = utf8.GetBytes("IBCP\n");
-            stream.Write(roleBytes, 0, roleBytes.Length);
-            var sess = AuthClient.Handshake(stream, new byte[] { (byte)'I', (byte)'B', (byte)'C', (byte)'P' });
-            if (sess == null) throw new IOException("control-plane authentication failed");
-
-            void Send(string line) => sess.WriteRecord(stream, utf8.GetBytes(line));
-
-            _reconnect.Reset(); // connected — reset the backoff schedule
-            Log.Write("Inkbridge", $"telemetry connected to {host}:{ControlPort} (authenticated, encrypted)");
-
-            // First encrypted record from the daemon is the beacon key (so BeaconListener can verify
-            // presence beacons). Store it; harmless if a future daemon omits it (we just retry reads).
-            try
-            {
-                var first = sess.ReadRecord(stream);
-                StoreBeaconKeyIfPresent(utf8.GetString(first));
-            }
-            catch (Exception e)
-            {
-                Log.Write("Inkbridge", $"beacon-key read failed: {e.Message}", LogLevel.Debug);
-            }
-
-            DateTime lastWrite = default;
-            PushConfigIfChanged(Send, ref lastWrite); // initial push
-
-            long lastPackets = Interlocked.Read(ref _packets);
-            long lastStamp = Stopwatch.GetTimestamp();
-            long pingSeq = 0;
-
+            var ci = CultureInfo.InvariantCulture;
             while (true)
             {
-                PushConfigIfChanged(Send, ref lastWrite);
-
-                // Round-trip latency via ping/pong, MATCHED so the number is real on Wi-Fi too.
-                // The daemon echoes our ping verbatim with "ping"→"pong" (control.rs), so a unique
-                // monotonic `ts` lets us accept only *this* ping's pong and drain any stale line. The
-                // previous code read a raw chunk and timed "first bytes available" — over Wi-Fi a
-                // pong already buffered locally returned in ~0.1 ms (no round trip), so the display
-                // alternated between the true latency and a bogus ~0.1 ms. Stopwatch is monotonic
-                // (QueryPerformanceCounter-backed), correct for sub-ms intervals.
-                double latencyMs = -1;
-                long seq = ++pingSeq;
-                string expectedPong = "{\"type\":\"pong\",\"ts\":" + seq + "}";
-                long t0 = Stopwatch.GetTimestamp();
-                Send("{\"type\":\"ping\",\"ts\":" + seq + "}");
-                // Read lines until our pong arrives (throws on timeout -> reconnect). Bounded so a
-                // chatty/misbehaving peer can't spin us forever within the receive timeout.
-                for (int i = 0; i < 8; i++)
+                if (ConnectionManager.Instance.IsConnected())
                 {
-                    var rec = sess.ReadRecord(stream); // decrypts one message; throws on timeout -> reconnect
-                    string line = utf8.GetString(rec);
-                    if (line.Trim() == expectedPong)
+                    PushConfigIfChanged();
+
+                    // Round-trip latency via ping/pong, matched so the number is real on Wi-Fi too.
+                    long seq;
+                    lock (_statGate)
                     {
-                        latencyMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
-                        break;
+                        seq = ++_pingSeq;
+                        _expectedPong = "{\"type\":\"pong\",\"ts\":" + seq + "}";
+                        _pingT0 = Stopwatch.GetTimestamp();
+                        _latencyMs = -1;
                     }
-                    // else: a stale pong from an earlier ping, or some other message — drain and retry.
+                    _pong.Reset();
+                    ConnectionManager.Instance.SendControl("{\"type\":\"ping\",\"ts\":" + seq + "}");
+                    _pong.Wait(800); // wait briefly for this ping's pong (read loop sets it)
+                    double latencyMs;
+                    lock (_statGate) latencyMs = _latencyMs;
+
+                    // received-packet rate = true PC↔device line throughput as seen here
+                    long nowPackets = Interlocked.Read(ref _packets);
+                    long nowStamp = Stopwatch.GetTimestamp();
+                    double secs = (nowStamp - _lastStamp) / (double)Stopwatch.Frequency;
+                    double rateHz = secs > 0 ? (nowPackets - _lastPackets) / secs : 0;
+                    _lastPackets = nowPackets;
+                    _lastStamp = nowStamp;
+
+                    ConnectionManager.Instance.SendControl(
+                        "{\"type\":\"status\",\"data\":{\"connected\":true,\"latency_ms\":"
+                        + latencyMs.ToString("F2", ci) + ",\"rate_hz\":" + rateHz.ToString("F0", ci) + "}}");
                 }
-
-                // received-packet rate = true PC↔device line throughput as seen here
-                long nowPackets = Interlocked.Read(ref _packets);
-                long nowStamp = Stopwatch.GetTimestamp();
-                double secs = (nowStamp - lastStamp) / (double)Stopwatch.Frequency;
-                double rateHz = secs > 0 ? (nowPackets - lastPackets) / secs : 0;
-                lastPackets = nowPackets;
-                lastStamp = nowStamp;
-
-                var ci = CultureInfo.InvariantCulture;
-                Send("{\"type\":\"status\",\"data\":{\"connected\":true,\"latency_ms\":"
-                     + latencyMs.ToString("F2", ci) + ",\"rate_hz\":" + rateHz.ToString("F0", ci) + "}}");
 
                 Thread.Sleep(1000);
             }
@@ -190,14 +166,15 @@ namespace Inkbridge
             }
         }
 
-        /// <summary>Read the active-area mapping from OTD's settings.json and push it if it changed.</summary>
-        private static void PushConfigIfChanged(Action<string> send, ref DateTime lastWrite)
+        /// <summary>Read the active-area mapping from OTD's settings.json and push it (channel 0) if it
+        /// changed since the last push (or since the last reconnect).</summary>
+        private static void PushConfigIfChanged()
         {
             string path = SettingsPath;
             DateTime w;
             try { w = File.GetLastWriteTimeUtc(path); }
             catch { return; }
-            if (w == lastWrite) return;
+            lock (_statGate) { if (w == _lastConfigWrite) return; }
 
             try
             {
@@ -222,8 +199,8 @@ namespace Inkbridge
                     + ",\"x_mm\":" + tx.ToString(ci) + ",\"y_mm\":" + ty.ToString(ci)
                     + ",\"rotation\":" + tr.ToString(ci) + "},"
                     + "\"display\":{\"width_px\":" + dw.ToString(ci) + ",\"height_px\":" + dh.ToString(ci) + "}}}";
-                send(cfg);
-                lastWrite = w;
+                ConnectionManager.Instance.SendControl(cfg);
+                lock (_statGate) _lastConfigWrite = w;
                 Log.Write("Inkbridge", $"pushed area {tw}×{th}mm rot{tr}");
             }
             catch (Exception e)
