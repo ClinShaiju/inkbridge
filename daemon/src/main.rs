@@ -22,6 +22,8 @@
 
 mod beacon;
 mod control;
+mod identity;
+mod mdns;
 mod orientation;
 mod packet;
 mod touch;
@@ -91,6 +93,10 @@ fn main() -> std::io::Result<()> {
     // Broadcast a UDP presence beacon (:9291) so a plugin that gave up its bounded pen-port
     // reconnect attempts wakes and reconnects the moment we're reachable again. Own thread.
     beacon::spawn();
+
+    // Advertise over mDNS/DNS-SD (_inkbridge._tcp) so the plugin discovers us on Wi-Fi with no
+    // hardcoded IP. Carries the persisted device id (UUID) for PC1<->rMPP1 filtering. Own thread.
+    mdns::spawn(identity::device_id());
 
     // Detect screen orientation (accelerometer + xochitl lock) and publish it; the pen
     // stream below stamps it into every packet so OTD can rotate the area to match.
