@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 using OpenTabletDriver.Plugin;
 
 namespace Inkbridge
@@ -256,16 +257,38 @@ namespace Inkbridge
         /// <summary>True if a daemon answers on the USB gadget IP within a short timeout.</summary>
         private static bool UsbReachable()
         {
+            var c = new TcpClient();
             try
             {
-                using var c = new TcpClient();
-                var ar = c.BeginConnect(UsbHost, PenPort, null, null);
-                if (!ar.AsyncWaitHandle.WaitOne(UsbProbeTimeoutMs)) return false;
-                c.EndConnect(ar);
-                return c.Connected;
+                var t = c.ConnectAsync(UsbHost, PenPort);
+                if (t.Wait(UsbProbeTimeoutMs) && c.Connected)
+                    return true;
+                // Timed out → we're abandoning the probe (the common case when the cable is unplugged).
+                // Observe the eventual fault so the aborted ConnectAsync doesn't surface as an
+                // unobserved task exception (finalizer-rethrown SocketException spam) when Close() below
+                // tears down the pending connect.
+                ObserveFault(t);
+                return false;
             }
-            catch { return false; }
+            catch
+            {
+                // Wait() throws AggregateException for a task that faulted within the timeout (e.g.
+                // connection refused) — accessing it here observes it.
+                return false;
+            }
+            finally
+            {
+                c.Close();
+            }
         }
+
+        /// <summary>Swallow a faulted task's exception so it isn't rethrown by the finalizer.</summary>
+        private static void ObserveFault(Task t) =>
+            t.ContinueWith(
+                static x => { _ = x.Exception; },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
 
         private void Unregister(Action abort)
         {
