@@ -10,6 +10,9 @@ libc = "0.2"
 # Pure-Rust mDNS/DNS-SD responder + UUID (musl-clean: no C/ring deps). See mdns.rs / identity.rs.
 mdns-sd = "0.11"
 uuid = { version = "1", features = ["v4"] }
+# Pure-Rust P-256 ECDSA for the identity handshake (Matter's curve; native in the .NET plugin). auth.rs
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [profile.release]
 opt-level = 3

@@ -142,6 +142,7 @@ pub fn spawn(
     orient: Arc<AtomicU8>,
     app_subs: Arc<AtomicUsize>,
     pen_in_range: Arc<AtomicBool>,
+    id: Arc<crate::identity::Identity>,
 ) {
     thread::spawn(move || {
         let listener = match TcpListener::bind(("0.0.0.0", PORT)) {
@@ -165,13 +166,14 @@ pub fn spawn(
             let orient = Arc::clone(&orient);
             let app_subs = Arc::clone(&app_subs);
             let pen_in_range = Arc::clone(&pen_in_range);
+            let id = Arc::clone(&id);
             thread::spawn(move || {
-                client_in(&refc);
                 crate::log(&format!("touch client connected: {peer:?}"));
-                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range) {
+                // Authenticates before the wakelock (see handle_client) — an unauthorized peer
+                // can't keep the device awake or read the touchscreen.
+                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range, &refc, &id) {
                     crate::log(&format!("touch session ended: {e}"));
                 }
-                client_out(&refc);
                 crate::log("touch client disconnected");
             });
         }
@@ -183,10 +185,29 @@ fn handle_client(
     orient: &AtomicU8,
     app_subs: &AtomicUsize,
     pen_in_range: &AtomicBool,
+    refc: &Arc<Mutex<WakeRefcount>>,
+    id: &crate::identity::Identity,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
-    stream.write_all(b"IBT1")?; // touch protocol hello (version 1)
+    stream.write_all(b"IBT1")?; // touch protocol hello (version 1) — also the auth channel tag
+    if !crate::auth::server_handshake(&mut stream, b"IBT1", id)? {
+        return Ok(()); // unauthorized: no wakelock, no touchscreen read
+    }
 
+    // Authorized: hold the device awake for the touch session.
+    client_in(refc);
+    let r = serve(&mut stream, orient, app_subs, pen_in_range);
+    client_out(refc);
+    r
+}
+
+/// Read the client options byte, then stream touch until the socket breaks.
+fn serve(
+    stream: &mut TcpStream,
+    orient: &AtomicU8,
+    app_subs: &AtomicUsize,
+    pen_in_range: &AtomicBool,
+) -> std::io::Result<()> {
     // Client replies with one options byte: bit0 = "always on" (stream even when the AppLoad
     // app is closed); bit1 = "no palm rejection" (don't suppress touch while the pen is in range).
     // Older/absent clients would block here, but plugin + daemon ship together.
@@ -196,7 +217,7 @@ fn handle_client(
     let palm_reject = opt[0] & 0x02 == 0; // bit set = DISABLE palm rejection
     crate::log(&format!("touch: client options always_on={always_on} palm_reject={palm_reject}"));
 
-    stream_touch(&mut stream, orient, app_subs, always_on, palm_reject, pen_in_range)
+    stream_touch(stream, orient, app_subs, always_on, palm_reject, pen_in_range)
 }
 
 /// Open `event3` (un-grabbed) and stream `TouchPacket`s until the socket breaks. Frames are

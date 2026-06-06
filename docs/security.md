@@ -123,8 +123,11 @@ release."
    is a deliberate choice the user makes (and is told carries LAN exposure). This alone removes the
    accidental-exposure case entirely.
 
-2. **Pinned-key identity = authentication + identity *(one mechanism, two problems)*.** Following the
-   HomeKit/Matter/WireGuard pattern — discovery *locates*, a key *authenticates*:
+2. **Pinned-key identity = authentication + identity *(one mechanism, two problems)*.**
+   **Status: SHIPPED for the pen (`:9292`) and touch (`:9294`) streams** — mutual P-256 signed-nonce
+   challenge-response, rejecting unauthorized peers *before* the wakelock. Control (`:9293`) is still
+   open (see note below). Following the HomeKit/Matter/WireGuard pattern — discovery *locates*, a key
+   *authenticates*:
    - **Locator:** a random **UUIDv4** generated once on the device (`/home/root/inkbridge/identity`,
      `0600`), advertised in the mDNS **TXT `id=`** so the plugin filters discovery to its paired
      device → *PC1 ↔ rMPP1* among several. The id is **public/spoofable — not a credential** (the SoC
@@ -150,7 +153,12 @@ release."
 
 5. **Gate the touch trigger on auth.** Count only **authenticated** `IBCS` subscribers toward
    `app_subs`, and require publisher auth before accepting `config`/`status`. Removes the
-   rogue-subscriber forced-touch-streaming and config-injection vectors (§3.3).
+   rogue-subscriber forced-touch-streaming and config-injection vectors (§3.3). *Pending — part of
+   the control-plane auth follow-on.* Note its residual impact is now small: touch itself requires
+   the key handshake, so a rogue `IBCS` can no longer let an attacker **read** touch; the worst it can
+   do is make the **legitimate** PC's touch stream flow with the app closed, plus read low-sensitivity
+   config/latency. The asymmetry to solve: the `IBCS` subscriber is the **on-device** app (localhost,
+   no PC key), so control auth needs a localhost bypass or a device-local credential.
 
 6. **Beacon hygiene.** Include the non-secret device id so plugins react only to their paired device;
    optionally **HMAC the beacon** to stop spoofed wake. Never put a secret in the broadcast.

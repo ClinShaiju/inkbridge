@@ -484,10 +484,12 @@ Everything new lives in **`daemon/`** and **`otd-plugin/`** — no new process o
 4. **Discovery:** extend the existing `:9291` beacon to carry `ip:port` (+ id) and have
    `BeaconListener` feed the resolve chain; add the `MulticastDNS=yes` drop-in to
    `install-service.sh`; then daemon `_inkbridge._tcp` + plugin browse for true zero-config.
-5. **Pairing + identity** (§5) — USB-bootstrapped token + device id; filter discovery by id so
-   PC1↔rMPP1; require the token on all four handshakes.
-6. **Security hardening** (§6) — secure-by-default binding (opt-in Wi-Fi), connection caps,
-   wakelock-only-for-authed, gate `app_subs` on auth; then stream encryption.
+5. **Pairing + identity** (§5) — ✅ **SHIPPED** (pen + touch): random UUID locator in mDNS TXT +
+   long-term P-256 keypair, USB-TOFU pinned, mutual signed-nonce challenge-response on `:9292`/`:9294`,
+   filtered by id so PC1↔rMPP1. *Remaining:* extend the same handshake to control (`:9293`).
+6. **Security hardening** (§6) — ✅ wakelock-only-for-authed is **done** on the authed channels.
+   *Remaining:* secure-by-default binding (opt-in Wi-Fi), connection caps, gate `app_subs` on auth,
+   then stream encryption (ECDH→HKDF→AES-GCM, reusing the pinned keys).
 7. **Power:** `power_save off` while a client is connected.
 8. **Docs/installer:** update copy that hardcodes `10.11.99.1`; document the Wi-Fi opt-in + pairing.
 

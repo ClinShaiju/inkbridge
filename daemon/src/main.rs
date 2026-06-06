@@ -20,6 +20,7 @@
 //!
 //! See docs/phase0-findings.md for device facts and protocol/packet.md for the wire format.
 
+mod auth;
 mod beacon;
 mod control;
 mod identity;
@@ -84,6 +85,10 @@ fn main() -> std::io::Result<()> {
     // Recover from any previous unclean exit that left the wakelock held.
     wakelock(false);
 
+    // Load the device identity once (UUID locator + P-256 keypair + authorized-PC allow-list).
+    // Shared with every connection handler for the mutual auth handshake.
+    let id = Arc::new(identity::Identity::load());
+
     // Start the control plane (TCP :9293) for the on-device visualizer. It relays the area config
     // + link status pushed by the OTD plugin (PC side) and broadcasts "disconnected" when the
     // plugin heartbeat goes stale. Own threads; never touches the pen stream below. Returns the
@@ -96,7 +101,7 @@ fn main() -> std::io::Result<()> {
 
     // Advertise over mDNS/DNS-SD (_inkbridge._tcp) so the plugin discovers us on Wi-Fi with no
     // hardcoded IP. Carries the persisted device id (UUID) for PC1<->rMPP1 filtering. Own thread.
-    mdns::spawn(identity::device_id());
+    mdns::spawn(id.device_id.clone());
 
     // Detect screen orientation (accelerometer + xochitl lock) and publish it; the pen
     // stream below stamps it into every packet so OTD can rotate the area to match.
@@ -113,7 +118,8 @@ fn main() -> std::io::Result<()> {
     // while a client is connected; shares the wakelock refcount and the orientation cell, gates
     // streaming on the AppLoad app being open (app_subs) unless the client opts out, and suppresses
     // touch while the pen is in range (pen_in_range).
-    touch::spawn(Arc::clone(&refc), Arc::clone(&orient), app_subs, Arc::clone(&pen_in_range));
+    touch::spawn(Arc::clone(&refc), Arc::clone(&orient), app_subs, Arc::clone(&pen_in_range),
+        Arc::clone(&id));
 
     for incoming in listener.incoming() {
         match incoming {
@@ -122,16 +128,14 @@ fn main() -> std::io::Result<()> {
                 let refc = Arc::clone(&refc);
                 let orient = Arc::clone(&orient);
                 let pen_in_range = Arc::clone(&pen_in_range);
+                let id = Arc::clone(&id);
                 thread::spawn(move || {
-                    // Hold the device awake so autosleep doesn't power down the digitizer.
-                    // xochitl is left running (no grab; pausing it would reboot the device).
-                    client_in(&refc);
                     log(&format!("client connected: {peer:?}"));
-                    if let Err(e) = handle_client(stream, &orient, &pen_in_range) {
+                    // handle_client authenticates BEFORE taking the wakelock, so an unauthorized
+                    // peer can't keep the device awake (battery-drain DoS) or read the digitizer.
+                    if let Err(e) = handle_client(stream, &orient, &pen_in_range, &refc, &id) {
                         log(&format!("session ended: {e}"));
                     }
-                    pen_in_range.store(false, Ordering::Relaxed); // pen client gone → unblock touch
-                    client_out(&refc);
                     log("client disconnected");
                 });
             }
@@ -141,15 +145,26 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// One client session: send hello, then stream until the socket breaks.
+/// One client session: hello, authenticate, then (only if authorized) hold the wakelock and stream.
 fn handle_client(
     mut stream: TcpStream,
     orient: &AtomicU8,
     pen_in_range: &AtomicBool,
+    refc: &Arc<Mutex<WakeRefcount>>,
+    id: &identity::Identity,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?; // latency over throughput
-    stream.write_all(b"IBR1")?; // protocol hello (version 1)
-    stream_pen(&mut stream, orient, pen_in_range)
+    stream.write_all(b"IBR1")?; // protocol hello (version 1) — also the auth channel tag
+    if !auth::server_handshake(&mut stream, b"IBR1", id)? {
+        return Ok(()); // unauthorized: no wakelock, no digitizer read
+    }
+
+    // Authorized: now hold the device awake (xochitl left running — pausing it would reboot).
+    client_in(refc);
+    let r = stream_pen(&mut stream, orient, pen_in_range);
+    pen_in_range.store(false, Ordering::Relaxed); // pen client gone → unblock touch
+    client_out(refc);
+    r
 }
 
 /// Open the pen device and stream PenPackets until the socket write fails (client gone)

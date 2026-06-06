@@ -167,6 +167,10 @@ namespace Inkbridge
                         hello[2] != (byte)'T' || hello[3] != (byte)'1')
                         throw new InvalidOperationException("bad inkbridge touch hello");
 
+                    // Mutual P-256 handshake before sending options / receiving touch (same as pen).
+                    if (!AuthClient.Handshake(stream, hello))
+                        throw new InvalidOperationException("inkbridge touch authentication failed");
+
                     // Reply with one options byte: bit0 = "always on" (daemon gates touch on the
                     // AppLoad app being open unless this is set); bit1 = "disable palm rejection".
                     byte optByte = 0;

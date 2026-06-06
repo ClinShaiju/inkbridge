@@ -15,8 +15,10 @@ namespace Inkbridge
     /// </summary>
     internal sealed class PluginConfig
     {
-        public string? device_id { get; set; }   // paired device UUID (TOFU on first discovery)
-        public string? wifi_host { get; set; }    // cached last-good Wi-Fi address
+        public string? device_id { get; set; }     // paired device UUID (TOFU on first discovery)
+        public string? wifi_host { get; set; }      // cached last-good Wi-Fi address
+        public string? pc_key { get; set; }         // this PC's P-256 private key (base64 PKCS#8)
+        public string? device_pubkey { get; set; }  // pinned device public key (hex SEC1, TOFU)
 
         private static readonly object _gate = new();
 
