@@ -2,6 +2,8 @@ using System;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using OpenTabletDriver.Plugin;
 
@@ -41,6 +43,43 @@ namespace Inkbridge
             new Thread(Run) { IsBackground = true, Name = "InkbridgeBeacon" }.Start();
         }
 
+        // Cached paired beacon credentials (loaded lazily once the device hands us its key over the
+        // control channel). Until paired, we accept the bare magic so first-run/bootstrap still wakes.
+        private static byte[]? _beaconKey;
+        private static string? _deviceId;
+
+        /// <summary>
+        /// A beacon counts only if it carries the magic AND (once we're paired) the right device id and
+        /// a valid HMAC, so a forged <c>IBR1</c> broadcast can't make us churn reconnects (T9).
+        /// Payload: <c>IBR1 ‖ id(36) ‖ HMAC-SHA256(beacon_key, IBR1‖id)[32]</c>.
+        /// </summary>
+        private static bool IsValidBeacon(byte[] d)
+        {
+            if (d.Length < 4 || d[0] != (byte)'I' || d[1] != (byte)'B' || d[2] != (byte)'R' || d[3] != (byte)'1')
+                return false;
+
+            if (_beaconKey == null)
+            {
+                var cfg = PluginConfig.Load();
+                if (!string.IsNullOrEmpty(cfg.beacon_key))
+                {
+                    try { _beaconKey = Convert.FromHexString(cfg.beacon_key); _deviceId = cfg.device_id; }
+                    catch { _beaconKey = null; }
+                }
+            }
+            if (_beaconKey == null)
+                return true; // not paired yet — accept bare magic (bootstrap / legacy daemon)
+
+            if (d.Length < 4 + 36 + 32) return false;
+            string id = Encoding.ASCII.GetString(d, 4, 36);
+            if (!string.Equals(id, _deviceId, StringComparison.OrdinalIgnoreCase)) return false;
+            using var h = new HMACSHA256(_beaconKey);
+            byte[] mac = h.ComputeHash(d, 0, 4 + 36);
+            var got = new byte[32];
+            Buffer.BlockCopy(d, 40, got, 0, 32);
+            return CryptographicOperations.FixedTimeEquals(mac, got);
+        }
+
         private static void Run()
         {
             while (true)
@@ -55,8 +94,7 @@ namespace Inkbridge
                     while (true)
                     {
                         byte[] data = udp.Receive(ref remote); // blocks until a datagram arrives
-                        if (data.Length >= 4 && data[0] == (byte)'I' && data[1] == (byte)'B' &&
-                            data[2] == (byte)'R' && data[3] == (byte)'1')
+                        if (IsValidBeacon(data))
                         {
                             Volatile.Write(ref _lastBeaconTicks, Stopwatch.GetTimestamp());
                             _pulse.Set();

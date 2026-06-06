@@ -18,12 +18,13 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use p256::ecdsa::SigningKey;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 
 const DIR: &str = "/home/root/inkbridge";
 const ID_FILE: &str = "/home/root/inkbridge/identity";
 const KEY_FILE: &str = "/home/root/inkbridge/device-key";
 const AUTH_FILE: &str = "/home/root/inkbridge/authorized_keys";
+const BKEY_FILE: &str = "/home/root/inkbridge/beacon-key";
 
 /// The device's long-term identity, loaded once at startup.
 pub struct Identity {
@@ -33,6 +34,9 @@ pub struct Identity {
     public: [u8; 65],
     /// Allow-listed PC public keys (hex of the 65-byte SEC1 form). Guarded for concurrent connects.
     authorized: Mutex<HashSet<String>>,
+    /// Device-wide secret for authenticating the presence beacon. Handed to authorized PCs over the
+    /// encrypted control channel; the beacon is HMAC'd with it so forged broadcasts are ignored (T9).
+    beacon_key: [u8; 32],
 }
 
 impl Identity {
@@ -42,7 +46,13 @@ impl Identity {
         let signing = load_or_make_key();
         let public = pub_bytes(&signing);
         let authorized = Mutex::new(load_authorized());
-        Identity { device_id, signing, public, authorized }
+        let beacon_key = load_or_make_beacon_key();
+        Identity { device_id, signing, public, authorized, beacon_key }
+    }
+
+    /// Device-wide beacon HMAC secret (handed to authorized PCs over the encrypted control channel).
+    pub fn beacon_key(&self) -> &[u8; 32] {
+        &self.beacon_key
     }
 
     pub fn signing(&self) -> &SigningKey {
@@ -119,6 +129,26 @@ fn load_or_make_key() -> SigningKey {
         crate::log("identity: could not persist device key; using ephemeral key");
     }
     key
+}
+
+fn load_or_make_beacon_key() -> [u8; 32] {
+    if let Ok(hex) = fs::read_to_string(BKEY_FILE) {
+        if let Some(b) = from_hex(hex.trim()) {
+            if b.len() == 32 {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&b);
+                return k;
+            }
+        }
+    }
+    let mut k = [0u8; 32];
+    OsRng.fill_bytes(&mut k);
+    let _ = fs::create_dir_all(DIR);
+    if fs::write(BKEY_FILE, to_hex(&k)).is_ok() {
+        secure(BKEY_FILE);
+        crate::log("generated beacon key");
+    }
+    k
 }
 
 fn load_authorized() -> HashSet<String> {

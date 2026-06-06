@@ -19,6 +19,7 @@ namespace Inkbridge
         public string? wifi_host { get; set; }      // cached last-good Wi-Fi address
         public string? pc_key { get; set; }         // this PC's P-256 private key (base64 PKCS#8)
         public string? device_pubkey { get; set; }  // pinned device public key (hex SEC1, TOFU)
+        public string? beacon_key { get; set; }      // device beacon HMAC secret (hex), via control
 
         private static readonly object _gate = new();
 

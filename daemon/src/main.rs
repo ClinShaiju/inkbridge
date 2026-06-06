@@ -20,9 +20,11 @@
 //!
 //! See docs/phase0-findings.md for device facts and protocol/packet.md for the wire format.
 
+mod access;
 mod auth;
 mod beacon;
 mod control;
+mod crypto;
 mod identity;
 mod mdns;
 mod orientation;
@@ -93,11 +95,11 @@ fn main() -> std::io::Result<()> {
     // + link status pushed by the OTD plugin (PC side) and broadcasts "disconnected" when the
     // plugin heartbeat goes stale. Own threads; never touches the pen stream below. Returns the
     // on-device-app subscriber count, used to gate touch passthrough to "AppLoad app is open".
-    let app_subs = control::spawn();
+    let app_subs = control::spawn(Arc::clone(&id));
 
     // Broadcast a UDP presence beacon (:9291) so a plugin that gave up its bounded pen-port
     // reconnect attempts wakes and reconnects the moment we're reachable again. Own thread.
-    beacon::spawn();
+    beacon::spawn(Arc::clone(&id));
 
     // Advertise over mDNS/DNS-SD (_inkbridge._tcp) so the plugin discovers us on Wi-Fi with no
     // hardcoded IP. Carries the persisted device id (UUID) for PC1<->rMPP1 filtering. Own thread.
@@ -121,19 +123,37 @@ fn main() -> std::io::Result<()> {
     touch::spawn(Arc::clone(&refc), Arc::clone(&orient), app_subs, Arc::clone(&pen_in_range),
         Arc::clone(&id));
 
+    // Cap concurrent pen connections (OTD briefly opens a 2nd transient on settings-apply, so allow
+    // a little headroom) to bound a connection-storm DoS.
+    let pen_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    const MAX_PEN_CONNS: usize = 4;
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let peer = stream.peer_addr().ok();
+                if !access::peer_allowed(peer) {
+                    log(&format!("pen: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
+                    continue; // drop before any work
+                }
+                let slot = match access::claim(&pen_conns, MAX_PEN_CONNS) {
+                    Some(s) => s,
+                    None => {
+                        log(&format!("pen: at connection cap ({MAX_PEN_CONNS}); dropping {peer:?}"));
+                        continue;
+                    }
+                };
+                let trusted_usb = access::is_usb_peer(peer);
                 let refc = Arc::clone(&refc);
                 let orient = Arc::clone(&orient);
                 let pen_in_range = Arc::clone(&pen_in_range);
                 let id = Arc::clone(&id);
                 thread::spawn(move || {
+                    let _slot = slot; // frees the connection slot when this handler exits
                     log(&format!("client connected: {peer:?}"));
                     // handle_client authenticates BEFORE taking the wakelock, so an unauthorized
                     // peer can't keep the device awake (battery-drain DoS) or read the digitizer.
-                    if let Err(e) = handle_client(stream, &orient, &pen_in_range, &refc, &id) {
+                    if let Err(e) = handle_client(stream, &orient, &pen_in_range, &refc, &id, trusted_usb) {
                         log(&format!("session ended: {e}"));
                     }
                     log("client disconnected");
@@ -152,16 +172,18 @@ fn handle_client(
     pen_in_range: &AtomicBool,
     refc: &Arc<Mutex<WakeRefcount>>,
     id: &identity::Identity,
+    trusted_usb: bool,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?; // latency over throughput
     stream.write_all(b"IBR1")?; // protocol hello (version 1) — also the auth channel tag
-    if !auth::server_handshake(&mut stream, b"IBR1", id)? {
-        return Ok(()); // unauthorized: no wakelock, no digitizer read
-    }
+    let mut sess = match auth::server_handshake(&mut stream, b"IBR1", id, trusted_usb)? {
+        Some(s) => s,
+        None => return Ok(()), // unauthorized: no wakelock, no digitizer read
+    };
 
     // Authorized: now hold the device awake (xochitl left running — pausing it would reboot).
     client_in(refc);
-    let r = stream_pen(&mut stream, orient, pen_in_range);
+    let r = stream_pen(&mut stream, orient, pen_in_range, &mut sess);
     pen_in_range.store(false, Ordering::Relaxed); // pen client gone → unblock touch
     client_out(refc);
     r
@@ -173,6 +195,7 @@ fn stream_pen(
     stream: &mut TcpStream,
     orient: &AtomicU8,
     pen_in_range: &AtomicBool,
+    sess: &mut crypto::Session,
 ) -> std::io::Result<()> {
     let mut dev = match find_pen() {
         Some(d) => d,
@@ -234,7 +257,7 @@ fn stream_pen(
                                     pen_in_range.store(state.in_range(), Ordering::Relaxed);
                                     let ts = start.elapsed().as_micros() as u32;
                                     state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
-                                    stream.write_all(&buf)?; // Err = client disconnected
+                                    sess.write_record(stream, &buf)?; // encrypted; Err = client gone
                                     last_send = Instant::now();
                                 }
                             }
@@ -255,7 +278,7 @@ fn stream_pen(
         if state.in_range() && last_send.elapsed() >= KEEPALIVE {
             let ts = start.elapsed().as_micros() as u32;
             state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
-            stream.write_all(&buf)?;
+            sess.write_record(stream, &buf)?;
             last_send = Instant::now();
         }
     }

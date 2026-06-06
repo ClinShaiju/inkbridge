@@ -86,21 +86,32 @@ namespace Inkbridge
             client.ReceiveTimeout = 2000;
             using var stream = client.GetStream();
             var utf8 = new UTF8Encoding(false);
-            // Line reader for the control plane (newline-delimited UTF-8). The daemon echoes each
-            // ping back as a pong on this same socket; reading whole *lines* (not raw chunks) is
-            // what lets us match a pong to its ping. Not disposed here on purpose — the underlying
-            // socket is owned by `using var stream` above.
-            var reader = new StreamReader(stream, utf8, false, 256, leaveOpen: true);
 
-            void Send(string line)
-            {
-                var b = utf8.GetBytes(line + "\n");
-                stream.Write(b, 0, b.Length);
-            }
+            // Send the publisher role line (plaintext), then run the P-256 handshake; everything
+            // after is AES-GCM records on the returned session (mirrors control.rs). Closes the
+            // config/status-injection + area/latency-eavesdrop holes on the control plane. The daemon
+            // echoes each ping back as a pong record, so a unique ts still matches request↔reply.
+            var roleBytes = utf8.GetBytes("IBCP\n");
+            stream.Write(roleBytes, 0, roleBytes.Length);
+            var sess = AuthClient.Handshake(stream, new byte[] { (byte)'I', (byte)'B', (byte)'C', (byte)'P' });
+            if (sess == null) throw new IOException("control-plane authentication failed");
 
-            Send("IBCP"); // publisher role
+            void Send(string line) => sess.WriteRecord(stream, utf8.GetBytes(line));
+
             _reconnect.Reset(); // connected — reset the backoff schedule
-            Log.Write("Inkbridge", $"telemetry connected to {host}:{ControlPort}");
+            Log.Write("Inkbridge", $"telemetry connected to {host}:{ControlPort} (authenticated, encrypted)");
+
+            // First encrypted record from the daemon is the beacon key (so BeaconListener can verify
+            // presence beacons). Store it; harmless if a future daemon omits it (we just retry reads).
+            try
+            {
+                var first = sess.ReadRecord(stream);
+                StoreBeaconKeyIfPresent(utf8.GetString(first));
+            }
+            catch (Exception e)
+            {
+                Log.Write("Inkbridge", $"beacon-key read failed: {e.Message}", LogLevel.Debug);
+            }
 
             DateTime lastWrite = default;
             PushConfigIfChanged(Send, ref lastWrite); // initial push
@@ -129,14 +140,14 @@ namespace Inkbridge
                 // chatty/misbehaving peer can't spin us forever within the receive timeout.
                 for (int i = 0; i < 8; i++)
                 {
-                    string? line = reader.ReadLine();
-                    if (line == null) throw new EndOfStreamException(); // peer closed
+                    var rec = sess.ReadRecord(stream); // decrypts one message; throws on timeout -> reconnect
+                    string line = utf8.GetString(rec);
                     if (line.Trim() == expectedPong)
                     {
                         latencyMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
                         break;
                     }
-                    // else: a stale pong from an earlier ping, or some other line — drain and retry.
+                    // else: a stale pong from an earlier ping, or some other message — drain and retry.
                 }
 
                 // received-packet rate = true PC↔device line throughput as seen here
@@ -152,6 +163,30 @@ namespace Inkbridge
                      + latencyMs.ToString("F2", ci) + ",\"rate_hz\":" + rateHz.ToString("F0", ci) + "}}");
 
                 Thread.Sleep(1000);
+            }
+        }
+
+        /// <summary>Persist the device's beacon key (+id) from a {"type":"beaconkey",...} control message.</summary>
+        private static void StoreBeaconKeyIfPresent(string line)
+        {
+            if (!line.Contains("\"beaconkey\"")) return;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                string? key = root.TryGetProperty("key", out var k) ? k.GetString() : null;
+                string? id = root.TryGetProperty("id", out var i) ? i.GetString() : null;
+                if (string.IsNullOrEmpty(key)) return;
+                var cfg = PluginConfig.Load();
+                if (cfg.beacon_key == key) return; // unchanged
+                cfg.beacon_key = key;
+                if (!string.IsNullOrEmpty(id)) cfg.device_id = id;
+                cfg.Save();
+                Log.Write("Inkbridge", "stored device beacon key");
+            }
+            catch (Exception e)
+            {
+                Log.Write("Inkbridge", $"beacon-key parse failed: {e.Message}", LogLevel.Debug);
             }
         }
 

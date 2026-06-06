@@ -20,7 +20,7 @@
 //! - Power: the rMPP autosleeps (`/sys/power/autosleep = mem`); we share main.rs's wakelock
 //!   refcount so the digitizer stays powered for the session.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -153,6 +153,8 @@ pub fn spawn(
             }
         };
         crate::log(&format!("touch plane listening on 0.0.0.0:{PORT}"));
+        let conns = Arc::new(AtomicUsize::new(0));
+        const MAX_TOUCH_CONNS: usize = 3;
         for incoming in listener.incoming() {
             let stream = match incoming {
                 Ok(s) => s,
@@ -162,16 +164,29 @@ pub fn spawn(
                 }
             };
             let peer = stream.peer_addr().ok();
+            if !crate::access::peer_allowed(peer) {
+                crate::log(&format!("touch: rejected {peer:?} — Wi-Fi exposure disabled (USB/loopback only)"));
+                continue;
+            }
+            let slot = match crate::access::claim(&conns, MAX_TOUCH_CONNS) {
+                Some(s) => s,
+                None => {
+                    crate::log(&format!("touch: at connection cap ({MAX_TOUCH_CONNS}); dropping {peer:?}"));
+                    continue;
+                }
+            };
+            let trusted_usb = crate::access::is_usb_peer(peer);
             let refc = Arc::clone(&refc);
             let orient = Arc::clone(&orient);
             let app_subs = Arc::clone(&app_subs);
             let pen_in_range = Arc::clone(&pen_in_range);
             let id = Arc::clone(&id);
             thread::spawn(move || {
+                let _slot = slot; // frees the connection slot on handler exit
                 crate::log(&format!("touch client connected: {peer:?}"));
                 // Authenticates before the wakelock (see handle_client) — an unauthorized peer
                 // can't keep the device awake or read the touchscreen.
-                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range, &refc, &id) {
+                if let Err(e) = handle_client(stream, &orient, &app_subs, &pen_in_range, &refc, &id, trusted_usb) {
                     crate::log(&format!("touch session ended: {e}"));
                 }
                 crate::log("touch client disconnected");
@@ -187,16 +202,18 @@ fn handle_client(
     pen_in_range: &AtomicBool,
     refc: &Arc<Mutex<WakeRefcount>>,
     id: &crate::identity::Identity,
+    trusted_usb: bool,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.write_all(b"IBT1")?; // touch protocol hello (version 1) — also the auth channel tag
-    if !crate::auth::server_handshake(&mut stream, b"IBT1", id)? {
-        return Ok(()); // unauthorized: no wakelock, no touchscreen read
-    }
+    let mut sess = match crate::auth::server_handshake(&mut stream, b"IBT1", id, trusted_usb)? {
+        Some(s) => s,
+        None => return Ok(()), // unauthorized: no wakelock, no touchscreen read
+    };
 
     // Authorized: hold the device awake for the touch session.
     client_in(refc);
-    let r = serve(&mut stream, orient, app_subs, pen_in_range);
+    let r = serve(&mut stream, orient, app_subs, pen_in_range, &mut sess);
     client_out(refc);
     r
 }
@@ -207,17 +224,17 @@ fn serve(
     orient: &AtomicU8,
     app_subs: &AtomicUsize,
     pen_in_range: &AtomicBool,
+    sess: &mut crate::crypto::Session,
 ) -> std::io::Result<()> {
-    // Client replies with one options byte: bit0 = "always on" (stream even when the AppLoad
+    // Client sends one encrypted options byte: bit0 = "always on" (stream even when the AppLoad
     // app is closed); bit1 = "no palm rejection" (don't suppress touch while the pen is in range).
-    // Older/absent clients would block here, but plugin + daemon ship together.
-    let mut opt = [0u8; 1];
-    stream.read_exact(&mut opt)?;
-    let always_on = opt[0] & 0x01 != 0;
-    let palm_reject = opt[0] & 0x02 == 0; // bit set = DISABLE palm rejection
+    let opt = sess.read_record(stream)?;
+    let opt0 = opt.first().copied().unwrap_or(0);
+    let always_on = opt0 & 0x01 != 0;
+    let palm_reject = opt0 & 0x02 == 0; // bit set = DISABLE palm rejection
     crate::log(&format!("touch: client options always_on={always_on} palm_reject={palm_reject}"));
 
-    stream_touch(stream, orient, app_subs, always_on, palm_reject, pen_in_range)
+    stream_touch(stream, orient, app_subs, always_on, palm_reject, pen_in_range, sess)
 }
 
 /// Open `event3` (un-grabbed) and stream `TouchPacket`s until the socket breaks. Frames are
@@ -229,6 +246,7 @@ fn stream_touch(
     always_on: bool,
     palm_reject: bool,
     pen_in_range: &AtomicBool,
+    sess: &mut crate::crypto::Session,
 ) -> std::io::Result<()> {
     let mut dev = match find_touch() {
         Some(d) => d,
@@ -294,7 +312,7 @@ fn stream_touch(
                                         // frame on the transition to no-fingers (PC issues UPs).
                                         if active || had_active {
                                             state.serialize(ts, orientation, &mut buf);
-                                            stream.write_all(&buf)?;
+                                            sess.write_record(stream, &buf)?;
                                         }
                                         had_active = active;
                                     } else if was_gated || had_active {
@@ -302,7 +320,7 @@ fn stream_touch(
                                         // one empty frame so the PC releases everything, then stay
                                         // quiet so the rMPP's own touch is unaffected.
                                         empty_frame(ts, orientation, &mut buf);
-                                        stream.write_all(&buf)?;
+                                        sess.write_record(stream, &buf)?;
                                         had_active = false;
                                     }
                                     was_gated = gated;
