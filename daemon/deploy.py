@@ -74,8 +74,8 @@ def main():
     run("systemctl restart inkbridge-daemon")
     print("restarted inkbridge-daemon")
     run("sleep 1; systemctl --no-pager status inkbridge-daemon | head -n 4")
-    print("--- listening ports (expect 9292 pen + 9293 control) ---")
-    run("netstat -ltn 2>/dev/null | grep -E ':929[23]' || ss -ltn 2>/dev/null | grep -E ':929[23]'")
+    print("--- listening ports (expect TCP 9292 muxed data; UDP 9291 beacon) ---")
+    run("netstat -ltun 2>/dev/null | grep -E ':929[12]' || ss -ltun 2>/dev/null | grep -E ':929[12]'")
     ssh.close()
 
 

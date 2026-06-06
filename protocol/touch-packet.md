@@ -4,19 +4,26 @@ Authoritative binary layout for rMPP daemon → Windows OTD plugin **touch** str
 of the pen `PenPacket` stream (`protocol/packet.md`). Derived from device discovery
 (`docs/touch-feasibility.md`). All multi-byte fields **little-endian**.
 
-## Transport
+> **v2 transport (shipped):** the 88-byte `TouchPacket` payload below is unchanged, but it is no
+> longer carried on its own TCP port. In v2 touch shares the **one muxed connection on `:9292`** as
+> **channel 2**, each frame sent as the plaintext of an AES-GCM record `[u32 len][ct‖tag]` with
+> plaintext `[channel(1)=2][88-byte TouchPacket]`. The touch reader starts on a `sub touch` control
+> message (channel 0) that **carries the options as fields** — `{"type":"sub","ch":"touch",
+> "always_on":<bool>,"palm":<bool>}` — replacing the standalone options byte. See `protocol/mux-v2.md`.
 
-- Raw TCP over USB RNDIS. The daemon listens on `0.0.0.0:9294` (reach it at `10.11.99.1:9294`).
+## Transport (payload + semantics — see mux-v2.md for the v2 framing)
+
 - `TCP_NODELAY` set. One `TouchPacket` per evdev `SYN_REPORT` **that has fingers down**, plus
   exactly one final all-empty frame on the transition to no-fingers (so the receiver can issue
   the touch-up for every contact). While no fingers are down the stream is silent.
-- No length prefix: packets are fixed size (**88 bytes**). The receiver reads in 88-byte frames.
-- A 4-byte ASCII hello `IBT1` is sent once by the daemon on connect, before the first packet.
-- **Then the client sends one options byte:**
-  - `bit0 = always_on` — when clear (default), the daemon forwards touch only while the on-device
-    AppLoad app is open (≥1 control-plane subscriber on `:9293`); when set, touch streams regardless.
-  - `bit1 = disable_palm_rejection` — when clear (default), the daemon suppresses touch while the pen
-    is in range (pen-priority palm rejection); when set, touch and pen are both active.
+- Fixed size **88 bytes** per frame.
+- **Options (v2: fields on the `sub touch` control message; v1: a byte after the `IBT1` hello):**
+  - `always_on` — when false (default), the daemon forwards touch only while the on-device AppLoad
+    app is open (≥1 loopback control subscriber); when true, touch streams regardless.
+  - `palm` — when true (default), the daemon suppresses touch while the pen is in range (pen-priority
+    palm rejection); when false, touch and pen are both active.
+- **v1 (historical):** raw TCP on `:9294`, unframed 88-byte packets after a one-time `IBT1` hello,
+  then a single options byte (`bit0=always_on`, `bit1=disable_palm_rejection`). v2 replaces this.
 - `event3` is read **un-grabbed** (like the pen) — the stock reMarkable UI and the AppLoad app
   still receive touch (so you can exit the app); the app-open gate, not a grab, is what keeps touch
   from leaking to Windows. The OTD plugin connects only in Direct or Gesture mode; in Disabled mode

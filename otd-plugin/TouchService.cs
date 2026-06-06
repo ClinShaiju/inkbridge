@@ -1,7 +1,3 @@
-using System;
-using System.IO;
-using System.Net.Sockets;
-using System.Threading;
 using OpenTabletDriver.Plugin;
 
 namespace Inkbridge
@@ -9,7 +5,7 @@ namespace Inkbridge
     /// <summary>Touch passthrough mode, chosen from the OTD "Touch mode" dropdown.</summary>
     public enum TouchMode
     {
-        /// <summary>No touch. The plugin never connects to :9294, so the daemon never reads event3.</summary>
+        /// <summary>No touch. The plugin never subscribes to the touch channel, so the daemon never reads event3.</summary>
         Disabled,
         /// <summary>Genuine Windows multitouch via InjectTouchInput (pinch-zoom / pan / rotate).</summary>
         DirectTouch,
@@ -35,184 +31,65 @@ namespace Inkbridge
     );
 
     /// <summary>
-    /// Owns the touch link to the rMPP daemon (TCP &lt;host&gt;:9294) and dispatches decoded
-    /// 88-byte frames to the consumer for the active <see cref="TouchMode"/>. A static singleton
-    /// so OTD's per-settings-apply reconstruction of <see cref="InkbridgeTool"/> just re-asserts
-    /// the mode (idempotent) instead of spawning duplicate readers — same pattern the device hub
-    /// uses (see InkbridgeTool's static _hub).
+    /// Selects the touch consumer for the active <see cref="TouchMode"/> and registers it (plus the
+    /// touch subscription + options) with the shared <see cref="ConnectionManager"/>, which owns the
+    /// muxed connection and routes channel-2 frames to the consumer. A static singleton so OTD's
+    /// per-settings-apply reconstruction of <see cref="InkbridgeTool"/> just re-asserts the mode
+    /// (idempotent) — same pattern the device hub uses.
     ///
-    /// The daemon treats a connected client as the enable signal (it grabs event3 and streams
-    /// only while we're connected), so switching to Disabled simply drops the connection and the
-    /// tablet's touchscreen returns to driving the stock UI.
+    /// Enabling a mode sends <c>sub touch</c> (the daemon then reads event3 and streams while the
+    /// AppLoad app is open / always-on); Disabled sends <c>unsub touch</c> and the tablet's
+    /// touchscreen returns to driving the stock UI.
     /// </summary>
     internal sealed class TouchService
     {
         public static readonly TouchService Instance = new();
 
-        private const int Port = 9294;
-
         private readonly object _gate = new();
         private TouchMode _mode = TouchMode.Disabled;
         private TouchOptions _opts;
-        private Thread? _worker;
-        private CancellationTokenSource? _cts;
-        // The worker's current connection, tracked so a mode switch can force-close it and
-        // unblock the worker's blocking socket read (Thread.Interrupt does not abort a Read).
-        private TcpClient? _client;
-        // Bounded backoff, then park on the device beacon instead of reconnecting forever.
-        private readonly ReconnectPolicy _reconnect = new("touch");
+        private ITouchConsumer? _consumer;
 
-        private TouchService()
-        {
-            // On a Connection (Auto/Wi-Fi/USB) switch, drop the live touch socket so the worker
-            // reconnects to the newly-resolved host. Socket-only; the reconnect loop re-reads the
-            // host each iteration. Process-lifetime registration (this is a singleton).
-            ConnectionConfig.Instance.RegisterAbort(AbortCurrentClient);
-        }
-
-        private void AbortCurrentClient()
-        {
-            lock (_gate) { try { _client?.Close(); } catch { } }
-        }
-
-        // Host is resolved by the shared ConnectionConfig (Auto/Wi-Fi/USB), same as the pen link.
-        private static string Host => ConnectionConfig.Instance.ResolveHost();
-
-        private static int TouchPort =>
-            int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_TOUCH_PORT"), out var p) ? p : Port;
+        private TouchService() { }
 
         /// <summary>
         /// Apply the selected <paramref name="mode"/> + <paramref name="opts"/>. No-op if nothing
-        /// changed; otherwise (re)start the reader worker. See <see cref="TouchOptions"/> for the
-        /// rotation / monitor / palm-rejection / always-on fields.
+        /// changed; otherwise build the consumer for the mode and (un)subscribe touch via the shared
+        /// connection. See <see cref="TouchOptions"/> for the rotation / monitor / palm / always-on
+        /// fields.
         /// </summary>
         public void SetMode(TouchMode mode, TouchOptions opts)
         {
             lock (_gate)
             {
-                bool running = _worker is { IsAlive: true };
-                bool unchanged = mode == _mode && opts == _opts;
-                if (unchanged && (mode == TouchMode.Disabled || running))
+                bool unchanged = mode == _mode && opts == _opts
+                    && (mode == TouchMode.Disabled || _consumer != null);
+                if (unchanged)
                     return;
 
-                StopLocked();
                 _mode = mode;
                 _opts = opts;
+
                 if (mode == TouchMode.Disabled)
                 {
+                    _consumer = null;
+                    ConnectionManager.Instance.SetTouch(false, opts, null);
                     Log.Write("Inkbridge", "Touch mode: Disabled");
                     return;
                 }
 
-                var cts = new CancellationTokenSource();
-                _cts = cts;
-                _worker = new Thread(() => Run(mode, opts, cts.Token))
-                {
-                    IsBackground = true,
-                    Name = "InkbridgeTouch",
-                };
-                _worker.Start();
-                Log.Write("Inkbridge", $"Touch mode: {mode} ({opts})");
-            }
-        }
-
-        private void StopLocked()
-        {
-            // Cancel the worker and force-close its socket so a blocking Read aborts at once.
-            // We don't Join (could stall OTD's settings-apply); the cancelled worker self-exits.
-            try { _cts?.Cancel(); } catch { }
-            try { _client?.Close(); } catch { }
-            _cts = null;
-            _client = null;
-            _worker = null;
-        }
-
-        private void Run(TouchMode mode, TouchOptions opts, CancellationToken token)
-        {
-            ITouchConsumer consumer;
-            if (mode == TouchMode.DirectTouch)
-            {
                 // With tap gestures, use the coordinator that withholds ambiguous multi-touch so a
                 // 2/3-finger tap fires Undo/Redo without Windows' competing right-click — while
                 // pinch/pan stay native and single-finger touch keeps zero latency. Otherwise plain.
-                consumer = opts.TapGestures
-                    ? new DirectTouchWithTaps(opts.Rotation, opts.Monitor)
-                    : new TouchInjector(opts.Rotation, opts.Monitor);
-            }
-            else
-            {
-                consumer = new TouchGestures();
-            }
+                ITouchConsumer consumer = mode == TouchMode.DirectTouch
+                    ? (opts.TapGestures
+                        ? new DirectTouchWithTaps(opts.Rotation, opts.Monitor)
+                        : new TouchInjector(opts.Rotation, opts.Monitor))
+                    : new TouchGestures();
 
-            _reconnect.Reset(); // fresh schedule for this worker
-            while (!token.IsCancellationRequested)
-            {
-                TcpClient? client = null;
-                string host = Host; // resolve once per attempt (Auto probes USB → don't repeat)
-                try
-                {
-                    client = new TcpClient { NoDelay = true };
-                    client.Connect(host, TouchPort);
-                    lock (_gate)
-                    {
-                        if (token.IsCancellationRequested) { client.Dispose(); break; }
-                        _client = client; // let StopLocked close it to unblock our Read
-                    }
-                    using var stream = client.GetStream();
-
-                    var hello = new byte[4];
-                    ReadExact(stream, hello, 4);
-                    if (hello[0] != (byte)'I' || hello[1] != (byte)'B' ||
-                        hello[2] != (byte)'T' || hello[3] != (byte)'1')
-                        throw new InvalidOperationException("bad inkbridge touch hello");
-
-                    // Mutual P-256 handshake before sending options / receiving touch (same as pen),
-                    // returning the encrypted session the touch stream rides on.
-                    var sess = AuthClient.Handshake(stream, hello);
-                    if (sess == null)
-                        throw new InvalidOperationException("inkbridge touch authentication failed");
-
-                    // Reply with one (encrypted) options byte: bit0 = "always on" (daemon gates touch
-                    // on the AppLoad app being open unless this is set); bit1 = "disable palm rejection".
-                    byte optByte = 0;
-                    if (opts.AlwaysOn) optByte |= 0x01;
-                    if (!opts.PalmReject) optByte |= 0x02;
-                    sess.WriteRecord(stream, new[] { optByte });
-
-                    _reconnect.Reset(); // connected — reset the backoff schedule
-                    Log.Write("Inkbridge", $"Touch connected to {host}:{TouchPort} ({mode})");
-
-                    while (!token.IsCancellationRequested)
-                    {
-                        var pt = sess.ReadRecord(stream); // one encrypted record → an 88-byte frame
-                        var frame = TouchPacket.Parse(pt);
-                        consumer.OnFrame(frame);
-                    }
-                }
-                catch (Exception e)
-                {
-                    if (!token.IsCancellationRequested)
-                        Log.Write("Inkbridge", $"Touch link down: {e.Message}; retrying", LogLevel.Debug);
-                }
-                finally
-                {
-                    consumer.Reset(); // release any held contacts so nothing sticks down
-                    try { client?.Dispose(); } catch { }
-                }
-
-                if (!token.IsCancellationRequested)
-                    _reconnect.Wait(() => token.IsCancellationRequested);
-            }
-        }
-
-        private static void ReadExact(NetworkStream s, byte[] buf, int count)
-        {
-            int off = 0;
-            while (off < count)
-            {
-                int n = s.Read(buf, off, count - off);
-                if (n <= 0) throw new EndOfStreamException();
-                off += n;
+                _consumer = consumer;
+                ConnectionManager.Instance.SetTouch(true, opts, consumer);
+                Log.Write("Inkbridge", $"Touch mode: {mode} ({opts})");
             }
         }
     }

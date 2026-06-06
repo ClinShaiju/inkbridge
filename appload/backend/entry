@@ -13,9 +13,12 @@ App message types (must match frontend/Main.qml):
   from frontend: 1 = GET_CONFIG, 2 = GET_STATUS
   to   frontend: 1 = CONFIG,     2 = STATUS   (contents = JSON string)
 
-Data source: the daemon control plane (TCP 127.0.0.1:9293) as a SUBSCRIBER ("IBCS"). The daemon
-broadcasts status (connected/rate) itself, and relays config pushed once by the host companion.
-Newline-delimited JSON there: {"type":"config"|"status","data":{...}} -> forwarded to the frontend.
+Data source: the daemon's muxed data port over loopback (TCP 127.0.0.1:9292) as a SUBSCRIBER
+("IBCS"). In v2 the three TCP ports were collapsed into one; the daemon special-cases loopback and
+speaks the same plaintext newline-JSON control protocol it used on the old :9293 — only the port
+changed. The daemon broadcasts status (connected/rate) itself, and relays config pushed by the host
+plugin. Newline-delimited JSON there: {"type":"config"|"status","data":{...}} -> forwarded to the
+frontend.
 On GET_CONFIG we also answer immediately from the on-disk seed so the box has data even before the
 daemon/companion are up. This backend never reads evdev.
 """
@@ -30,7 +33,7 @@ import time
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEED_FILE = os.path.join(APP_DIR, "area.json")
-CONTROL_HOST, CONTROL_PORT = "127.0.0.1", 9293
+CONTROL_HOST, CONTROL_PORT = "127.0.0.1", 9292
 
 # AppLoad system message types
 SYS_TERMINATE = 0xFFFFFFFF
@@ -105,7 +108,7 @@ class Backend:
                 c = socket.create_connection((CONTROL_HOST, CONTROL_PORT), timeout=5)
                 c.sendall(b"IBCS\n")
                 self.control_up = True
-                print("[inkbridge] subscribed to daemon control :9293", file=sys.stderr)
+                print("[inkbridge] subscribed to daemon control :9292 (loopback)", file=sys.stderr)
                 buf = b""
                 while self.running:
                     chunk = c.recv(4096)

@@ -1,108 +1,58 @@
-//! inkbridge control plane — pub/sub relay on TCP :9293, separate from the pen stream (:9292).
+//! inkbridge control plane (v2) — pub/sub relay multiplexed onto the data port's control channel.
 //!
-//! All status now originates on the PC: the OpenTabletDriver plugin (which is always running with
-//! OTD and already holds the pen link) connects here as a PUBLISHER ("IBCP") and:
-//!   - pushes the active-area `config` (read from OTD's settings.json), re-pushing on change;
-//!   - every ~1 s sends a `ping` (we echo `pong` so it can measure round-trip latency) and a
-//!     `status` message {connected, latency_ms, rate_hz} reflecting the real PC<->device link.
+//! In v1 this was a standalone TCP listener on :9293. In v2 the control logic is split:
+//!   - the PC publisher's messages arrive on the muxed connection's **control channel** (channel 0,
+//!     authenticated + encrypted): `mux.rs` answers `ping` with `pong`, and calls [`apply_config`] /
+//!     [`apply_status`] here. The beacon key is handed to the PC by `mux.rs` over the same channel.
+//!   - the on-device AppLoad app still connects over **loopback** as a plaintext, line-JSON
+//!     subscriber ("IBCS") — now on the data port `:9292` ([`handle_loopback_subscriber`]).
 //!
-//! The daemon just relays to subscribers ("IBCS", the on-device app backend) and, crucially,
-//! detects when the plugin's heartbeat goes stale (USB pulled / OTD closed) and broadcasts a
-//! "disconnected" status within HOST_TIMEOUT — so the on-device UI reflects the true link state.
+//! This module owns the shared [`Hub`] (last config/status + subscriber writers) and the staleness
+//! broadcaster that flips the on-device UI to "disconnected" when the PC heartbeat goes stale.
 //!
-//! Wire format: newline-delimited UTF-8. First line is the role token. Publisher lines are compact
-//! JSON: {"type":"config",...}, {"type":"ping","ts":N}, {"type":"status","data":{...}}.
-//! std-only: messages are opaque strings (classified by substring); no serde.
+//! Wire format on the loopback path is unchanged from v1: newline-delimited UTF-8 JSON, classified by
+//! substring (std-only; no serde).
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::auth;
-use crate::crypto::Session;
-use crate::identity::Identity;
-
-const CONTROL_PORT: u16 = 9293;
 /// A status heartbeat older than this means the PC<->device link is down.
 const HOST_TIMEOUT: Duration = Duration::from_secs(3);
 const DISCONNECTED: &str =
     "{\"type\":\"status\",\"data\":{\"connected\":false,\"latency_ms\":-1.0,\"rate_hz\":0.0}}";
 
 #[derive(Default)]
-struct Hub {
-    /// Writer clones of connected subscribers; dead ones are reaped on the next fanout.
+pub struct Hub {
+    /// Writer clones of connected (loopback) subscribers; dead ones are reaped on the next fanout.
     subs: Vec<TcpStream>,
     last_config: Option<String>,
-    /// Most recent status the plugin pushed, and when (host-liveness clock).
+    /// Most recent status the PC pushed, and when (host-liveness clock).
     last_status: Option<String>,
     last_status_at: Option<Instant>,
     /// What we last broadcast (replayed to a subscriber on connect).
     last_broadcast: Option<String>,
 }
 
-/// Start the control plane (listener + staleness broadcaster) in their own threads.
-/// Returns a counter of currently-connected on-device app subscribers (`IBCS`). The touch
-/// stream uses this as the "AppLoad app is open" signal to gate touch passthrough.
-pub fn spawn(id: Arc<Identity>) -> Arc<AtomicUsize> {
+/// Start the staleness broadcaster and return the shared [`Hub`] plus the on-device-app subscriber
+/// count (`app_subs`, the touch passthrough gate). The data-port listener (`mux.rs`) feeds both: PC
+/// control messages via [`apply_config`] / [`apply_status`], loopback subscribers via
+/// [`handle_loopback_subscriber`].
+pub fn spawn_hub() -> (Arc<Mutex<Hub>>, Arc<AtomicUsize>) {
     let hub = Arc::new(Mutex::new(Hub::default()));
     let app_subs = Arc::new(AtomicUsize::new(0));
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || broadcast_loop(hub));
     }
-    {
-        let app_subs = Arc::clone(&app_subs);
-        thread::spawn(move || {
-            if let Err(e) = run(hub, app_subs, id) {
-                crate::log(&format!("control plane stopped: {e}"));
-            }
-        });
-    }
-    app_subs
+    (hub, app_subs)
 }
 
-fn run(hub: Arc<Mutex<Hub>>, app_subs: Arc<AtomicUsize>, id: Arc<Identity>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT))?;
-    crate::log(&format!("control plane listening on 0.0.0.0:{CONTROL_PORT}"));
-    // Cap concurrent control connections (publisher + local subscriber + replays/transients).
-    let conns = Arc::new(AtomicUsize::new(0));
-    const MAX_CONTROL_CONNS: usize = 6;
-    for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if !crate::access::peer_allowed(stream.peer_addr().ok()) {
-            crate::log(&format!(
-                "control: rejected {:?} — Wi-Fi exposure disabled (USB/loopback only)",
-                stream.peer_addr().ok()
-            ));
-            continue;
-        }
-        let slot = match crate::access::claim(&conns, MAX_CONTROL_CONNS) {
-            Some(s) => s,
-            None => {
-                crate::log(&format!("control: at connection cap ({MAX_CONTROL_CONNS}); dropping"));
-                continue;
-            }
-        };
-        let hub = Arc::clone(&hub);
-        let app_subs = Arc::clone(&app_subs);
-        let id = Arc::clone(&id);
-        thread::spawn(move || {
-            let _slot = slot; // frees the connection slot on handler exit
-            if let Err(e) = handle(stream, hub, app_subs, id) {
-                crate::log(&format!("control client ended: {e}"));
-            }
-        });
-    }
-    Ok(())
-}
-
-/// Every second, broadcast the plugin's latest status if it's fresh, else "disconnected".
+/// Every second, broadcast the PC's latest status to loopback subscribers if it's fresh, else
+/// "disconnected".
 fn broadcast_loop(hub: Arc<Mutex<Hub>>) {
     loop {
         thread::sleep(Duration::from_millis(1000));
@@ -119,88 +69,39 @@ fn broadcast_loop(hub: Arc<Mutex<Hub>>) {
     }
 }
 
-fn handle(
-    mut stream: TcpStream,
-    hub: Arc<Mutex<Hub>>,
-    app_subs: Arc<AtomicUsize>,
-    id: Arc<Identity>,
-) -> std::io::Result<()> {
+/// PC published a new area config (channel 0): store it and fan out to loopback subscribers in
+/// plaintext (they're local/trusted).
+pub fn apply_config(hub: &Arc<Mutex<Hub>>, msg: &str) {
+    let mut h = hub.lock().unwrap();
+    h.last_config = Some(msg.to_string());
+    let payload = format!("{msg}\n");
+    h.subs.retain_mut(|w| w.write_all(payload.as_bytes()).is_ok());
+}
+
+/// PC pushed a link status (channel 0): record it (+ timestamp) for the staleness broadcaster.
+pub fn apply_status(hub: &Arc<Mutex<Hub>>, msg: &str) {
+    let mut h = hub.lock().unwrap();
+    h.last_status = Some(msg.to_string());
+    h.last_status_at = Some(Instant::now());
+}
+
+/// On-device app (loopback only — `mux.rs` gates on the peer being loopback): read the `IBCS` role
+/// line, register as a subscriber, replay the latest config + last broadcast, then read until EOF.
+/// A connected subscriber counts toward `app_subs`, which gates touch passthrough ("AppLoad app open").
+pub fn handle_loopback_subscriber(
+    stream: TcpStream,
+    hub: &Arc<Mutex<Hub>>,
+    app_subs: &Arc<AtomicUsize>,
+) -> io::Result<()> {
     stream.set_nodelay(true).ok();
-    let peer = stream.peer_addr().ok();
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut role = String::new();
     reader.read_line(&mut role)?;
-    match role.trim() {
-        "IBCS" => {
-            // Only the on-device app (loopback) may subscribe. This is also what gates app_subs
-            // (T5): a LAN host can't inflate "app open" / force touch streaming or read config.
-            if !is_loopback(peer) {
-                crate::log(&format!("control: rejected non-local subscriber {peer:?}"));
-                return Ok(());
-            }
-            handle_subscriber(stream, reader, hub, app_subs)
-        }
-        "IBCP" => {
-            // The PC publisher must authenticate (P-256 handshake) and then the link is encrypted —
-            // so a LAN peer can't inject config/status or read the area/latency. Auth frames are
-            // read via `reader` (which may already hold buffered post-role bytes).
-            let trusted_usb = crate::access::is_usb_peer(peer);
-            let mut session = {
-                let mut rw = Rw { r: &mut reader, w: &mut stream };
-                match auth::server_handshake(&mut rw, b"IBCP", &id, trusted_usb)? {
-                    Some(s) => s,
-                    None => return Ok(()),
-                }
-            };
-            // Hand the authenticated PC the beacon key (first encrypted record) so it can verify our
-            // presence beacon (T9). Safe to send only now — the channel is authenticated + encrypted.
-            let bk = format!(
-                "{{\"type\":\"beaconkey\",\"key\":\"{}\",\"id\":\"{}\"}}",
-                crate::identity::to_hex(id.beacon_key()),
-                id.device_id
-            );
-            session.write_record(&mut stream, bk.as_bytes())?;
-            handle_publisher(stream, reader, hub, session)
-        }
-        "" => Ok(()), // throwaway/probe connection — ignore silently
-        other => {
-            crate::log(&format!("control: unknown role {other:?}"));
-            Ok(())
-        }
+    if role.trim() != "IBCS" {
+        crate::log(&format!("control: unknown loopback role {:?}", role.trim()));
+        return Ok(());
     }
-}
 
-fn is_loopback(peer: Option<SocketAddr>) -> bool {
-    peer.map(|p| p.ip().is_loopback()).unwrap_or(false)
-}
-
-/// Read/Write adapter so the auth handshake can read from the role-line `BufReader` (preserving any
-/// buffered bytes) while writing to the raw stream.
-struct Rw<'a> {
-    r: &'a mut BufReader<TcpStream>,
-    w: &'a mut TcpStream,
-}
-impl Read for Rw<'_> {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        self.r.read(b)
-    }
-}
-impl Write for Rw<'_> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.w.write(b)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.w.flush()
-    }
-}
-
-/// Subscriber: register a writer, replay the latest config + last broadcast, then read until EOF.
-fn handle_subscriber(
-    stream: TcpStream,
-    mut reader: BufReader<TcpStream>,
-    hub: Arc<Mutex<Hub>>,
-    app_subs: Arc<AtomicUsize>,
-) -> std::io::Result<()> {
     {
         let mut h = hub.lock().unwrap();
         let mut w = stream.try_clone()?;
@@ -212,8 +113,7 @@ fn handle_subscriber(
         h.subs.push(w);
         crate::log(&format!("control: subscriber joined ({} total)", h.subs.len()));
     }
-    // An on-device app subscriber being connected == the AppLoad app is open. The touch stream
-    // reads this to gate passthrough (touch only flows while the app is open, unless overridden).
+
     let n = app_subs.fetch_add(1, Ordering::Relaxed) + 1;
     crate::log(&format!("control: app present (subscribers={n})"));
     let mut line = String::new();
@@ -226,47 +126,5 @@ fn handle_subscriber(
     }
     let left = app_subs.fetch_sub(1, Ordering::Relaxed) - 1;
     crate::log(&format!("control: app gone (subscribers={left})"));
-    Ok(())
-}
-
-/// Publisher: authenticated + encrypted. Echo pings as pongs (PC RTT), store config (fanned out to
-/// the local subscribers in plaintext), record link status. Messages are AES-GCM records, one per
-/// line of the old protocol.
-fn handle_publisher(
-    mut writer: TcpStream,
-    mut reader: BufReader<TcpStream>,
-    hub: Arc<Mutex<Hub>>,
-    mut session: Session,
-) -> std::io::Result<()> {
-    crate::log("control: publisher joined (authenticated, encrypted)");
-    loop {
-        let pt = match session.read_record(&mut reader) {
-            Ok(p) => p,
-            Err(_) => break, // EOF / socket gone / bad record
-        };
-        let line = String::from_utf8_lossy(&pt);
-        let msg = line.trim();
-        if msg.is_empty() {
-            continue;
-        }
-        if msg.contains("\"type\":\"ping\"") {
-            // echo back as pong (same ts) so the PC can measure round-trip latency
-            let pong = msg.replacen("ping", "pong", 1);
-            if session.write_record(&mut writer, pong.as_bytes()).is_err() {
-                break;
-            }
-            continue;
-        }
-        let mut h = hub.lock().unwrap();
-        if msg.contains("\"type\":\"config\"") {
-            h.last_config = Some(msg.to_string());
-            // Fan out to the on-device (loopback) subscribers in plaintext — they're local/trusted.
-            let payload = format!("{msg}\n");
-            h.subs.retain_mut(|w| w.write_all(payload.as_bytes()).is_ok());
-        } else if msg.contains("\"type\":\"status\"") {
-            h.last_status = Some(msg.to_string());
-            h.last_status_at = Some(Instant::now());
-        }
-    }
     Ok(())
 }

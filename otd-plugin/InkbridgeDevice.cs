@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Net.Sockets;
 using OpenTabletDriver.Plugin;
 using OpenTabletDriver.Plugin.Devices;
 
@@ -17,108 +15,19 @@ namespace Inkbridge
     }
 
     /// <summary>
-    /// Connects to the rMPP daemon and reads 18-byte frames after the 4-byte "IBR1" hello.
-    /// Reconnects on failure. The host is resolved per attempt through <see cref="ConnectionConfig"/>
-    /// (Auto/Wi-Fi/USB), so a mode change or live USB-takeover re-points the link without re-detecting
-    /// the OTD device tree: a registered abort closes the current socket and the next EnsureConnected
-    /// re-resolves. Port via INKBRIDGE_PORT (default 9292).
+    /// Pen packet source backed by the shared <see cref="ConnectionManager"/>: the connection,
+    /// handshake, encryption, and reconnect all live there now (v2 muxed transport). On open this
+    /// subscribes the pen channel; <see cref="Next"/> blocks on the manager's pen-frame queue, which
+    /// is fed off channel 1 of the one connection. The OTD device-endpoint contract is unchanged — the
+    /// endpoint just no longer owns a socket.
     /// </summary>
-    internal sealed class TcpSource : IPacketSource
+    internal sealed class ManagerPenSource : IPacketSource
     {
-        private readonly int _port;
-        private TcpClient? _client;
-        private Stream? _stream;
-        private CryptoSession? _sess;
-        private bool _disposed;
-        // Bounded backoff, then park on the device beacon instead of reconnecting forever.
-        private readonly ReconnectPolicy _reconnect = new("pen");
-        // Lets ConnectionConfig drop our socket on a mode switch / USB-takeover (force reconnect).
-        private readonly IDisposable _abortReg;
+        public ManagerPenSource() => ConnectionManager.Instance.OpenPen();
 
-        public TcpSource(int port)
-        {
-            _port = port;
-            _abortReg = ConnectionConfig.Instance.RegisterAbort(AbortCurrent);
-        }
+        public byte[] Next() => ConnectionManager.Instance.NextPenPacket();
 
-        // Close the live socket so a blocking ReadExact aborts and EnsureConnected re-resolves.
-        private void AbortCurrent() { try { _client?.Close(); } catch { } }
-
-        private void EnsureConnected()
-        {
-            while (!_disposed && _stream == null)
-            {
-                string host = ConnectionConfig.Instance.ResolveHost();
-                try
-                {
-                    _client = new TcpClient();
-                    _client.NoDelay = true;
-                    _client.Connect(host, _port);
-                    var s = _client.GetStream();
-                    var hello = new byte[4];
-                    ReadExact(s, hello, 4);
-                    if (hello[0] != (byte)'I' || hello[1] != (byte)'B' ||
-                        hello[2] != (byte)'R' || hello[3] != (byte)'1')
-                        throw new IOException("bad inkbridge hello");
-                    // Mutual P-256 handshake before any pen data (authenticates the device + this PC),
-                    // returning the encrypted session the pen stream now rides on.
-                    var sess = AuthClient.Handshake(s, hello);
-                    if (sess == null)
-                        throw new IOException("inkbridge authentication failed");
-                    _sess = sess;
-                    _stream = s;
-                    _reconnect.Reset();
-                    Log.Write("Inkbridge", $"Connected to daemon at {host}:{_port}");
-                }
-                catch (Exception e)
-                {
-                    Log.Write("Inkbridge", $"Connect to {host}:{_port} failed: {e.Message}", LogLevel.Warning);
-                    Cleanup();
-                    _reconnect.Wait(() => _disposed);
-                }
-            }
-        }
-
-        public byte[] Next()
-        {
-            while (true)
-            {
-                EnsureConnected();
-                if (_disposed) return new byte[PenPacket.Size];
-                try
-                {
-                    // Each daemon pen packet is one encrypted record → decrypts to an 18-byte packet.
-                    var buf = _sess!.ReadRecord(_stream!);
-                    InkbridgeTelemetry.NotePacket(); // feed the PC↔device line-rate metric
-                    return buf;
-                }
-                catch (Exception e)
-                {
-                    Log.Write("Inkbridge", $"Stream read failed: {e.Message}; reconnecting", LogLevel.Warning);
-                    Cleanup();
-                }
-            }
-        }
-
-        private static void ReadExact(Stream s, byte[] buf, int count)
-        {
-            int off = 0;
-            while (off < count)
-            {
-                int n = s.Read(buf, off, count - off);
-                if (n <= 0) throw new EndOfStreamException();
-                off += n;
-            }
-        }
-
-        private void Cleanup()
-        {
-            try { _stream?.Dispose(); } catch { }
-            try { _client?.Dispose(); } catch { }
-            _stream = null; _client = null; _sess = null;
-        }
-
-        public void Dispose() { _disposed = true; _abortReg.Dispose(); Cleanup(); }
+        public void Dispose() => ConnectionManager.Instance.ClosePen();
     }
 
     /// <summary>OTD device endpoint stream wrapping a packet source.</summary>
@@ -154,10 +63,10 @@ namespace Inkbridge
 
         public IDeviceEndpointStream Open()
         {
-            // Host is resolved per-connect by ConnectionConfig (Auto/Wi-Fi/USB); only the port is fixed here.
-            int port = int.TryParse(Environment.GetEnvironmentVariable("INKBRIDGE_PORT"), out var p) ? p : 9292;
-            Log.Write("Inkbridge", $"Opening TCP packet source (port {port}, mode-resolved host)");
-            return new InkbridgeStream(new TcpSource(port));
+            // The shared ConnectionManager owns the muxed connection (host resolved per-connect by
+            // ConnectionConfig); this just subscribes the pen channel and reads decoded frames.
+            Log.Write("Inkbridge", "Opening pen packet source (muxed connection)");
+            return new InkbridgeStream(new ManagerPenSource());
         }
 
         public string GetDeviceString(byte index) => string.Empty;
