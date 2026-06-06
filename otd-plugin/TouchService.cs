@@ -144,7 +144,6 @@ namespace Inkbridge
                 consumer = new TouchGestures();
             }
 
-            var buf = new byte[TouchPacket.Size];
             _reconnect.Reset(); // fresh schedule for this worker
             while (!token.IsCancellationRequested)
             {
@@ -167,24 +166,26 @@ namespace Inkbridge
                         hello[2] != (byte)'T' || hello[3] != (byte)'1')
                         throw new InvalidOperationException("bad inkbridge touch hello");
 
-                    // Mutual P-256 handshake before sending options / receiving touch (same as pen).
-                    if (!AuthClient.Handshake(stream, hello))
+                    // Mutual P-256 handshake before sending options / receiving touch (same as pen),
+                    // returning the encrypted session the touch stream rides on.
+                    var sess = AuthClient.Handshake(stream, hello);
+                    if (sess == null)
                         throw new InvalidOperationException("inkbridge touch authentication failed");
 
-                    // Reply with one options byte: bit0 = "always on" (daemon gates touch on the
-                    // AppLoad app being open unless this is set); bit1 = "disable palm rejection".
+                    // Reply with one (encrypted) options byte: bit0 = "always on" (daemon gates touch
+                    // on the AppLoad app being open unless this is set); bit1 = "disable palm rejection".
                     byte optByte = 0;
                     if (opts.AlwaysOn) optByte |= 0x01;
                     if (!opts.PalmReject) optByte |= 0x02;
-                    stream.WriteByte(optByte);
+                    sess.WriteRecord(stream, new[] { optByte });
 
                     _reconnect.Reset(); // connected — reset the backoff schedule
                     Log.Write("Inkbridge", $"Touch connected to {host}:{TouchPort} ({mode})");
 
                     while (!token.IsCancellationRequested)
                     {
-                        ReadExact(stream, buf, TouchPacket.Size);
-                        var frame = TouchPacket.Parse(buf);
+                        var pt = sess.ReadRecord(stream); // one encrypted record → an 88-byte frame
+                        var frame = TouchPacket.Parse(pt);
                         consumer.OnFrame(frame);
                     }
                 }

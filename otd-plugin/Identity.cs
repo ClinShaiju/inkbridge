@@ -70,6 +70,28 @@ namespace Inkbridge
             return _pc!.SignData(msg, HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
         }
 
+        /// <summary>
+        /// ECDH shared secret (raw 32-byte X) between this PC's key and the device's 65-byte SEC1
+        /// public key — the ikm for the stream-encryption HKDF. Matches Rust p256 `raw_secret_bytes`.
+        /// </summary>
+        public static byte[] DeriveShared(byte[] devPub65)
+        {
+            Ensure();
+            var mine = _pc!.ExportParameters(true); // includes private D
+            using var ecdh = ECDiffieHellman.Create();
+            ecdh.ImportParameters(mine);
+            var x = new byte[32];
+            var y = new byte[32];
+            Buffer.BlockCopy(devPub65, 1, x, 0, 32);
+            Buffer.BlockCopy(devPub65, 33, y, 0, 32);
+            using var peer = ECDiffieHellman.Create(new ECParameters
+            {
+                Curve = ECCurve.NamedCurves.nistP256,
+                Q = new ECPoint { X = x, Y = y },
+            });
+            return ecdh.DeriveRawSecretAgreement(peer.PublicKey);
+        }
+
         /// <summary>Verify a device signature against a 65-byte SEC1 public key.</summary>
         public static bool VerifyDevice(byte[] devPub65, byte[] msg, byte[] sig)
         {
@@ -101,10 +123,11 @@ namespace Inkbridge
 
         /// <summary>
         /// Perform the handshake over <paramref name="s"/> for the given 4-byte channel
-        /// <paramref name="tag"/> (IBR1 / IBT1). Returns true on success. Throws on socket errors so the
-        /// caller reconnects; returns false on an auth failure (bad/mismatched device, rejected PC).
+        /// <paramref name="tag"/> (IBR1 / IBT1 / IBCP). Returns the established <see cref="CryptoSession"/>
+        /// on success. Throws on socket errors so the caller reconnects; returns null on an auth
+        /// failure (bad/mismatched device).
         /// </summary>
-        public static bool Handshake(Stream s, byte[] tag)
+        public static CryptoSession? Handshake(Stream s, byte[] tag)
         {
             // 1. send pub_pc[65] ‖ nonce_pc[32]
             var noncePc = new byte[32];
@@ -128,7 +151,7 @@ namespace Inkbridge
             if (!Identity.VerifyDevice(devPub, Msg(noncePc, tag, RoleDev), sigDev))
             {
                 Log.Write("Inkbridge", "auth: device signature invalid; refusing", LogLevel.Warning);
-                return false;
+                return null;
             }
 
             // pin the device key (trust-on-first-use), or require it to match the pinned one
@@ -145,13 +168,18 @@ namespace Inkbridge
                 Log.Write("Inkbridge",
                     "auth: device key does NOT match the paired device; refusing (re-pair over USB to reset)",
                     LogLevel.Error);
-                return false;
+                return null;
             }
 
             // 4. prove our key over (nonce_dev ‖ tag ‖ "PC")
             var sigPc = Identity.Sign(Msg(nonceDev, tag, RolePc));
             s.Write(sigPc, 0, sigPc.Length);
-            return true;
+
+            // 5. derive the encrypted session (ECDH → HKDF; see CryptoSession). Plugin sends PC→dev,
+            //    receives dev→PC.
+            var shared = Identity.DeriveShared(devPub);
+            return new CryptoSession(shared, noncePc, nonceDev, tag,
+                CryptoSession.DirPcToDev, CryptoSession.DirDevToPc);
         }
 
         private static byte[] Msg(byte[] nonce, byte[] tag, byte[] role)

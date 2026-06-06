@@ -28,6 +28,7 @@ namespace Inkbridge
         private readonly int _port;
         private TcpClient? _client;
         private Stream? _stream;
+        private CryptoSession? _sess;
         private bool _disposed;
         // Bounded backoff, then park on the device beacon instead of reconnecting forever.
         private readonly ReconnectPolicy _reconnect = new("pen");
@@ -59,9 +60,12 @@ namespace Inkbridge
                     if (hello[0] != (byte)'I' || hello[1] != (byte)'B' ||
                         hello[2] != (byte)'R' || hello[3] != (byte)'1')
                         throw new IOException("bad inkbridge hello");
-                    // Mutual P-256 handshake before any pen data (authenticates the device + this PC).
-                    if (!AuthClient.Handshake(s, hello))
+                    // Mutual P-256 handshake before any pen data (authenticates the device + this PC),
+                    // returning the encrypted session the pen stream now rides on.
+                    var sess = AuthClient.Handshake(s, hello);
+                    if (sess == null)
                         throw new IOException("inkbridge authentication failed");
+                    _sess = sess;
                     _stream = s;
                     _reconnect.Reset();
                     Log.Write("Inkbridge", $"Connected to daemon at {host}:{_port}");
@@ -83,8 +87,8 @@ namespace Inkbridge
                 if (_disposed) return new byte[PenPacket.Size];
                 try
                 {
-                    var buf = new byte[PenPacket.Size];
-                    ReadExact(_stream!, buf, PenPacket.Size);
+                    // Each daemon pen packet is one encrypted record → decrypts to an 18-byte packet.
+                    var buf = _sess!.ReadRecord(_stream!);
                     InkbridgeTelemetry.NotePacket(); // feed the PC↔device line-rate metric
                     return buf;
                 }
@@ -111,7 +115,7 @@ namespace Inkbridge
         {
             try { _stream?.Dispose(); } catch { }
             try { _client?.Dispose(); } catch { }
-            _stream = null; _client = null;
+            _stream = null; _client = null; _sess = null;
         }
 
         public void Dispose() { _disposed = true; _abortReg.Dispose(); Cleanup(); }
