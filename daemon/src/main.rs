@@ -99,7 +99,7 @@ fn main() -> std::io::Result<()> {
 
     // Broadcast a UDP presence beacon (:9291) so a plugin that gave up its bounded pen-port
     // reconnect attempts wakes and reconnects the moment we're reachable again. Own thread.
-    beacon::spawn();
+    beacon::spawn(Arc::clone(&id));
 
     // Advertise over mDNS/DNS-SD (_inkbridge._tcp) so the plugin discovers us on Wi-Fi with no
     // hardcoded IP. Carries the persisted device id (UUID) for PC1<->rMPP1 filtering. Own thread.

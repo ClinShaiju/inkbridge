@@ -464,6 +464,7 @@ dependencies = [
  "aes-gcm",
  "evdev",
  "hkdf",
+ "hmac",
  "libc",
  "mdns-sd",
  "p256",

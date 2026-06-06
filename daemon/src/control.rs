@@ -145,13 +145,21 @@ fn handle(
             // so a LAN peer can't inject config/status or read the area/latency. Auth frames are
             // read via `reader` (which may already hold buffered post-role bytes).
             let trusted_usb = crate::access::is_usb_peer(peer);
-            let session = {
+            let mut session = {
                 let mut rw = Rw { r: &mut reader, w: &mut stream };
                 match auth::server_handshake(&mut rw, b"IBCP", &id, trusted_usb)? {
                     Some(s) => s,
                     None => return Ok(()),
                 }
             };
+            // Hand the authenticated PC the beacon key (first encrypted record) so it can verify our
+            // presence beacon (T9). Safe to send only now — the channel is authenticated + encrypted.
+            let bk = format!(
+                "{{\"type\":\"beaconkey\",\"key\":\"{}\",\"id\":\"{}\"}}",
+                crate::identity::to_hex(id.beacon_key()),
+                id.device_id
+            );
+            session.write_record(&mut stream, bk.as_bytes())?;
             handle_publisher(stream, reader, hub, session)
         }
         "" => Ok(()), // throwaway/probe connection — ignore silently

@@ -14,20 +14,28 @@
 //! up, broadcast-capable IPv4 interface. The payload mirrors the pen hello bytes (`IBR1`).
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+use crate::identity::Identity;
+
 const BEACON_PORT: u16 = 9291;
 const BEACON_INTERVAL: Duration = Duration::from_millis(1000);
-/// Same 4 bytes as the pen-stream hello, so the plugin validates the beacon the same way.
-const BEACON_MSG: &[u8] = b"IBR1";
+/// Magic prefix (also the pen-stream hello), kept so a legacy/unpaired plugin still recognizes us.
+const BEACON_MAGIC: &[u8] = b"IBR1";
 
 /// Start broadcasting the presence beacon in its own thread. Never touches the pen stream.
-pub fn spawn() {
-    thread::spawn(beacon_loop);
+/// Payload: `IBR1 ‖ device_id(36 ascii) ‖ HMAC-SHA256(beacon_key, IBR1‖device_id)[32]` — so a plugin
+/// that holds the paired beacon key reacts only to its own device and ignores forged broadcasts (T9).
+pub fn spawn(id: Arc<Identity>) {
+    thread::spawn(move || beacon_loop(id));
 }
 
-fn beacon_loop() {
+fn beacon_loop(id: Arc<Identity>) {
     let sock = match UdpSocket::bind(("0.0.0.0", 0)) {
         Ok(s) => s,
         Err(e) => {
@@ -39,15 +47,24 @@ fn beacon_loop() {
         crate::log(&format!("beacon: set_broadcast failed: {e}"));
         return;
     }
-    crate::log(&format!("presence beacon broadcasting on :{BEACON_PORT}"));
+
+    // Precompute the fixed payload: magic ‖ id ‖ HMAC(beacon_key, magic‖id).
+    let mut payload = Vec::with_capacity(4 + 36 + 32);
+    payload.extend_from_slice(BEACON_MAGIC);
+    payload.extend_from_slice(id.device_id.as_bytes());
+    let mut mac = <Hmac<Sha256>>::new_from_slice(id.beacon_key()).expect("hmac key");
+    mac.update(&payload);
+    payload.extend_from_slice(&mac.finalize().into_bytes());
+
+    crate::log(&format!("presence beacon broadcasting on :{BEACON_PORT} (authenticated)"));
     loop {
         let targets = broadcast_addrs();
         if targets.is_empty() {
             // No enumerable interface broadcast addr — fall back to limited broadcast.
-            let _ = sock.send_to(BEACON_MSG, (Ipv4Addr::BROADCAST, BEACON_PORT));
+            let _ = sock.send_to(&payload, (Ipv4Addr::BROADCAST, BEACON_PORT));
         } else {
             for b in targets {
-                let _ = sock.send_to(BEACON_MSG, SocketAddrV4::new(b, BEACON_PORT));
+                let _ = sock.send_to(&payload, SocketAddrV4::new(b, BEACON_PORT));
             }
         }
         thread::sleep(BEACON_INTERVAL);
