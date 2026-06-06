@@ -24,6 +24,7 @@ mod access;
 mod auth;
 mod beacon;
 mod control;
+mod crypto;
 mod identity;
 mod mdns;
 mod orientation;
@@ -160,13 +161,14 @@ fn handle_client(
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?; // latency over throughput
     stream.write_all(b"IBR1")?; // protocol hello (version 1) — also the auth channel tag
-    if !auth::server_handshake(&mut stream, b"IBR1", id)? {
-        return Ok(()); // unauthorized: no wakelock, no digitizer read
-    }
+    let mut sess = match auth::server_handshake(&mut stream, b"IBR1", id)? {
+        Some(s) => s,
+        None => return Ok(()), // unauthorized: no wakelock, no digitizer read
+    };
 
     // Authorized: now hold the device awake (xochitl left running — pausing it would reboot).
     client_in(refc);
-    let r = stream_pen(&mut stream, orient, pen_in_range);
+    let r = stream_pen(&mut stream, orient, pen_in_range, &mut sess);
     pen_in_range.store(false, Ordering::Relaxed); // pen client gone → unblock touch
     client_out(refc);
     r
@@ -178,6 +180,7 @@ fn stream_pen(
     stream: &mut TcpStream,
     orient: &AtomicU8,
     pen_in_range: &AtomicBool,
+    sess: &mut crypto::Session,
 ) -> std::io::Result<()> {
     let mut dev = match find_pen() {
         Some(d) => d,
@@ -239,7 +242,7 @@ fn stream_pen(
                                     pen_in_range.store(state.in_range(), Ordering::Relaxed);
                                     let ts = start.elapsed().as_micros() as u32;
                                     state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
-                                    stream.write_all(&buf)?; // Err = client disconnected
+                                    sess.write_record(stream, &buf)?; // encrypted; Err = client gone
                                     last_send = Instant::now();
                                 }
                             }
@@ -260,7 +263,7 @@ fn stream_pen(
         if state.in_range() && last_send.elapsed() >= KEEPALIVE {
             let ts = start.elapsed().as_micros() as u32;
             state.serialize(ts, orient.load(Ordering::Relaxed), &mut buf);
-            stream.write_all(&buf)?;
+            sess.write_record(stream, &buf)?;
             last_send = Instant::now();
         }
     }

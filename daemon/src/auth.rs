@@ -22,36 +22,40 @@ use std::io::{self, Read, Write};
 
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, VerifyingKey};
+use p256::{PublicKey, SecretKey};
 use rand_core::{OsRng, RngCore};
 
+use crate::crypto::{Session, DIR_DEV_TO_PC, DIR_PC_TO_DEV};
 use crate::identity::{self, Identity};
 
-/// Authenticate a freshly-accepted client. Returns Ok(true) if the peer is the paired/authorized PC.
-/// On Ok(false) the caller must drop the connection without doing any work.
+/// Authenticate a freshly-accepted client and, on success, return the established encrypted
+/// `Session`. On Ok(None) the caller must drop the connection without doing any work.
 pub fn server_handshake<S: Read + Write>(
     stream: &mut S,
     tag: &[u8; 4],
     id: &Identity,
-) -> io::Result<bool> {
+) -> io::Result<Option<Session>> {
     // 1. Read the PC hello: pub_pc[65] ‖ nonce_pc[32].
     let mut hello = [0u8; 97];
     stream.read_exact(&mut hello)?;
     let pub_pc = &hello[..65];
-    let nonce_pc = &hello[65..97];
+    let nonce_pc = [0u8; 32];
+    let mut nonce_pc = nonce_pc;
+    nonce_pc.copy_from_slice(&hello[65..97]);
 
     let pub_pc_hex = identity::to_hex(pub_pc);
     let pc_key = match VerifyingKey::from_sec1_bytes(pub_pc) {
         Ok(k) => k,
         Err(_) => {
             crate::log("auth: malformed PC public key");
-            return Ok(false);
+            return Ok(None);
         }
     };
 
     // 2. Send our hello + our signature over (nonce_pc ‖ tag ‖ "DEV").
     let mut nonce_dev = [0u8; 32];
     OsRng.fill_bytes(&mut nonce_dev);
-    let sig_dev: Signature = id.signing().sign(&msg(nonce_pc, tag, b"DEV"));
+    let sig_dev: Signature = id.signing().sign(&msg(&nonce_pc, tag, b"DEV"));
 
     let mut resp = Vec::with_capacity(161);
     resp.extend_from_slice(id.public());
@@ -64,23 +68,42 @@ pub fn server_handshake<S: Read + Write>(
     stream.read_exact(&mut sig_pc_bytes)?;
     let sig_pc = match Signature::from_slice(&sig_pc_bytes) {
         Ok(s) => s,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     if pc_key.verify(&msg(&nonce_dev, tag, b"PC"), &sig_pc).is_err() {
         crate::log("auth: PC signature failed");
-        return Ok(false);
+        return Ok(None);
     }
 
     // 4. Authorize: trust-on-first-use for the first PC, else require it to be pinned.
-    if id.is_authorized(&pub_pc_hex) {
-        Ok(true)
+    let authorized = if id.is_authorized(&pub_pc_hex) {
+        true
     } else if id.no_peers() {
         id.authorize(&pub_pc_hex); // bootstrap (expected over USB)
-        Ok(true)
+        true
     } else {
         crate::log("auth: PC key not authorized (not the paired PC); rejecting");
-        Ok(false)
+        false
+    };
+    if !authorized {
+        return Ok(None);
     }
+
+    // 5. Derive the encrypted session: ECDH(device static, PC static) → HKDF (see crypto.rs).
+    let my_sk = SecretKey::from_slice(&id.signing().to_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "device key"))?;
+    let peer_pk = PublicKey::from_sec1_bytes(pub_pc)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "peer key"))?;
+    let shared = p256::ecdh::diffie_hellman(my_sk.to_nonzero_scalar(), peer_pk.as_affine());
+    let session = Session::new(
+        shared.raw_secret_bytes(),
+        &nonce_pc,
+        &nonce_dev,
+        tag,
+        DIR_DEV_TO_PC,
+        DIR_PC_TO_DEV,
+    );
+    Ok(Some(session))
 }
 
 /// Build the signed message: nonce ‖ channel-tag ‖ role. Binding the tag stops a signature captured
